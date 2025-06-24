@@ -23,7 +23,7 @@ func NewSigner() *Signer {
 		panic(fmt.Sprintf("failed to generate private key: %v", err))
 	}
 
-	return newSignerWithPrivateKey(key)
+	return newSignerWithRawPrivateKey(key)
 }
 
 func NewSignerWithKey(key string) *Signer {
@@ -33,10 +33,10 @@ func NewSignerWithKey(key string) *Signer {
 		panic(fmt.Sprintf("failed to create private key from hex: %v", err))
 	}
 
-	return newSignerWithPrivateKey(privateKey)
+	return newSignerWithRawPrivateKey(privateKey)
 }
 
-func newSignerWithPrivateKey(key *ecdsa.PrivateKey) *Signer {
+func newSignerWithRawPrivateKey(key *ecdsa.PrivateKey) *Signer {
 	return &Signer{
 		key: key,
 	}
@@ -51,7 +51,7 @@ func (h *Signer) Key() string {
 	return fmt.Sprintf("%02x", privateKeyBytes)
 }
 
-func (h *Signer) privateKey() *ecdsa.PrivateKey {
+func (h *Signer) RawPrivateKey() *ecdsa.PrivateKey {
 	if h.key == nil {
 		panic("Signer: Key is nil")
 	}
