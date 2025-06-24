@@ -3,6 +3,8 @@ package ethtestserver
 import (
 	"crypto/ecdsa"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -27,13 +29,23 @@ func NewSigner() *Signer {
 }
 
 func NewSignerWithKey(key string) *Signer {
+	if key == "" {
+		panic("Signer: key is empty")
+	}
+
+	key = strings.TrimPrefix(key, "0x") // remove 0x prefix if present
+
 	privateKey, err := crypto.HexToECDSA(key)
 	if err != nil {
 		// this is a test utility, it either works or it panics
 		panic(fmt.Sprintf("failed to create private key from hex: %v", err))
 	}
 
-	return newSignerWithRawPrivateKey(privateKey)
+	s := newSignerWithRawPrivateKey(privateKey)
+
+	slog.Info("NewSignerWithKey", "key", s.Key(), "address", s.Address().Hex())
+
+	return s
 }
 
 func newSignerWithRawPrivateKey(key *ecdsa.PrivateKey) *Signer {

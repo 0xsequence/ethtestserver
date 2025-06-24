@@ -487,6 +487,17 @@ func (s *ETHTestServer) ContractTransact(ctx context.Context, signer *Signer, co
 	return nil
 }
 
+func (s *ETHTestServer) PrintStatus() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bc := s.ethereum.BlockChain()
+	slog.Info("ETHTestServer Status",
+		"latestBlock", bc.CurrentBlock().Number,
+		"latestBlockHash", bc.CurrentBlock().Hash().Hex(),
+	)
+}
+
 func (s *ETHTestServer) ContractCall(ctx context.Context, contract *ethcontract.Contract, response interface{}, methodName string, methodArgs ...interface{}) error {
 	provider, err := s.Provider()
 	if err != nil {
