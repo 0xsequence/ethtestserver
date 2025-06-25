@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -14,8 +13,6 @@ import (
 // Signer is a helper type that encapsulates a signing key
 type Signer struct {
 	key *ecdsa.PrivateKey
-
-	nonce atomic.Uint64 // Nonce for the next transaction
 }
 
 func NewSigner() *Signer {

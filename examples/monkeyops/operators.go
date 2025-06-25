@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
-	"time"
 
 	"github.com/0xsequence/ethtestserver"
 
@@ -17,25 +16,25 @@ import (
 
 var txSigner = types.HomesteadSigner{}
 
+// runMonkeyTransferors uses the given sender and recipient pools for ETH transfers.
 func runMonkeyTransferors(ctx context.Context, server *ethtestserver.ETHTestServer, senders []*ethtestserver.Signer, recipients []*ethtestserver.Signer) (*ethtestserver.MonkeyOperator, error) {
-	// Monkey transferor
+	// Create a monkey doer for ETH transfers.
 	monkeyTransferor := ethtestserver.NewMonkeyDoer(
 		func(ctx context.Context, op *ethtestserver.MonkeyOperator, gen *core.BlockGen) (*types.Transaction, error) {
-
 			sender := ethtestserver.PickRandomSigner(senders)
 			recipient := ethtestserver.PickRandomSigner(recipients)
-
 			amount := ethtestserver.PickRandomAmount(1, 100)
-
-			slog.Debug("ETH transfer",
-				"sender", sender.Address().Hex(),
-				"recipient", recipient.Address().Hex(),
-				"amount", amount.String(),
-			)
 
 			nonce := gen.TxNonce(sender.Address())
 
-			tx, _ := types.SignTx(
+			slog.Info("ETH transfer",
+				"sender", sender.Address().Hex(),
+				"recipient", recipient.Address().Hex(),
+				"amount", amount.String(),
+				"nonce", nonce,
+			)
+
+			tx, err := types.SignTx(
 				types.NewTransaction(
 					nonce,
 					recipient.Address(),
@@ -47,12 +46,14 @@ func runMonkeyTransferors(ctx context.Context, server *ethtestserver.ETHTestServ
 				txSigner,
 				sender.RawPrivateKey(),
 			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to sign ETH transfer: %w", err)
+			}
 
 			return tx, nil
 		},
 	)
 
-	// Random ETH transfers using monkey signers
 	monkeyTransferOperator, err := ethtestserver.NewMonkeyOperator(
 		nil,
 		monkeyTransferor,
@@ -62,18 +63,20 @@ func runMonkeyTransferors(ctx context.Context, server *ethtestserver.ETHTestServ
 		return nil, fmt.Errorf("failed to create monkey transfer operator: %w", err)
 	}
 
-	err = monkeyTransferOperator.Run(ctx)
-	if err != nil {
+	if err = monkeyTransferOperator.Run(ctx); err != nil {
 		return nil, fmt.Errorf("failed to run monkey transfer operator: %w", err)
 	}
 
 	return monkeyTransferOperator, nil
 }
 
-func runMonkeyERC1155Transferors(ctx context.Context, server *ethtestserver.ETHTestServer, monkeySigners []*ethtestserver.Signer) (*ethtestserver.MonkeyOperator, error) {
+// runMonkeyERC1155Transferors deploys an ERC1155 contract, mints tokens for
+// each sender, and sets up a monkey operator to transfer these tokens between
+// senders.
+func runMonkeyERC1155Transferors(ctx context.Context, server *ethtestserver.ETHTestServer, senders []*ethtestserver.Signer, recipients []*ethtestserver.Signer, tokenMin int64, tokenMax int64, mintAmount int64) (*ethtestserver.MonkeyOperator, error) {
 	slog.Info("Deploying ERC1155 contract for monkey transfers")
 
-	contractDeployer := monkeySigners[0]
+	contractDeployer := ethtestserver.PickRandomSigner(senders)
 
 	erc1155Contract, err := server.DeployContract(
 		ctx,
@@ -85,77 +88,55 @@ func runMonkeyERC1155Transferors(ctx context.Context, server *ethtestserver.ETHT
 		return nil, fmt.Errorf("failed to deploy ERC1155 contract: %w", err)
 	}
 
-	// prepare a pool of signers for minting
-	senders := monkeySigners[1:10]
-	tokenID := big.NewInt(1)
-
-	for i := range senders {
-		recipient := senders[i]
-
-		err = server.ContractTransact(
-			ctx,
-			contractDeployer,
-			erc1155Contract,
-			"mint",
-			recipient.Address(),
-			tokenID,
-			big.NewInt(100), // mint 100 tokens
-			[]byte{},
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to mint ERC1155 tokens for recipient %s: %w", recipient.Address().Hex(), err)
-		}
-	}
-
-	// print balances of the minted tokens for each signer
-	{
-		tokenBalances := make(map[common.Address]*big.Int)
-		for _, signer := range senders {
-			var balance *big.Int
-			err := server.ContractCall(
+	// Mint tokens for each sender
+	for i := tokenMin; i <= tokenMax; i++ {
+		tokenID := big.NewInt(i)
+		for _, s := range senders {
+			slog.Info("Minting ERC1155 tokens", "address", s.Address())
+			err = server.ContractTransact(
 				ctx,
+				contractDeployer,
 				erc1155Contract,
-				&balance,
-				"balanceOf",
-				signer.Address(), // owner
-				tokenID,          // tokenId
+				"mint",
+				s.Address(),
+				tokenID,
+				big.NewInt(mintAmount),
+				[]byte{},
 			)
 			if err != nil {
-				return nil, fmt.Errorf("failed to get balance for signer %s: %w", signer.Address().Hex(), err)
+				return nil, fmt.Errorf("failed to mint ERC1155 tokens for %s: %w", s.Address().Hex(), err)
 			}
-			tokenBalances[signer.Address()] = balance
-
-			slog.Info("Minted ERC1155 tokens", "signer", signer.Address().Hex(), "balance", balance.String())
+			slog.Info("Minted ERC1155 tokens",
+				"contract", erc1155Contract.Address.Hex(),
+				"recipient", s.Address().Hex(),
+				"tokenID", tokenID.String(),
+				"amount", mintAmount,
+			)
 		}
 	}
 
 	monkeyERC1155Doer := ethtestserver.NewMonkeyDoer(
 		func(ctx context.Context, op *ethtestserver.MonkeyOperator, gen *core.BlockGen) (*types.Transaction, error) {
-			// Pick two random signers from the provided pool.
-			signers, err := op.PickSigners(2)
-			if err != nil {
-				return nil, fmt.Errorf("failed to pick signers for monkey ERC1155 transfer: %w", err)
-			}
+			// Pick sender from the senders pool and recipient from the recipients pool.
+			sender := ethtestserver.PickRandomSigner(senders)
+			recipient := ethtestserver.PickRandomSigner(recipients)
 
-			sender, recipient := signers[0], signers[1]
-			tokenID := big.NewInt(1) // Use the same token ID as minted earlier
+			tokenID := ethtestserver.PickRandomAmount(tokenMin, tokenMax)
+			amount := ethtestserver.PickRandomAmount(1, mintAmount)
 
-			// Pack the call data for the safeTransferFrom method.
 			calldata, err := erc1155Contract.ABI.Pack(
 				"safeTransferFrom",
 				sender.Address(),    // from
 				recipient.Address(), // to
-				tokenID,             // tokenId
-				big.NewInt(1),       // transfer 1 token
-				[]byte{},            // data
+				tokenID,
+				amount,
+				[]byte{},
 			)
 			if err != nil {
 				return nil, fmt.Errorf("failed to pack safeTransferFrom call: %w", err)
 			}
 
-			// Create a transaction to call the contract.
 			nonce := gen.TxNonce(sender.Address())
-
 			tx := types.NewTransaction(
 				nonce,
 				common.Address(erc1155Contract.Address),
@@ -164,131 +145,83 @@ func runMonkeyERC1155Transferors(ctx context.Context, server *ethtestserver.ETHT
 				gen.BaseFee(),
 				calldata,
 			)
-
-			//signer := types.LatestSigner(params.AllDevChainProtocolChanges)
-
-			signer := types.HomesteadSigner{}
-			signedTx, err := types.SignTx(tx, signer, sender.RawPrivateKey())
+			signedTx, err := types.SignTx(tx, txSigner, sender.RawPrivateKey())
 			if err != nil {
-				return nil, fmt.Errorf("failed to sign transaction: %w", err)
+				return nil, fmt.Errorf("failed to sign ERC1155 transfer transaction: %w", err)
 			}
 
 			return signedTx, nil
 		},
 	)
 
-	monkeyTransferOperator, err := ethtestserver.NewMonkeyOperator(&ethtestserver.MonkeyOperatorConfig{
-		Signers: senders,
-		Ticks:   100,
-	}, monkeyERC1155Doer, server)
+	monkeyTransferOperator, err := ethtestserver.NewMonkeyOperator(
+		&ethtestserver.MonkeyOperatorConfig{
+			Signers: senders,
+		},
+		monkeyERC1155Doer,
+		server,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create monkey skyweaver transfer operator: %w", err)
+		return nil, fmt.Errorf("failed to create monkey ERC1155 transfer operator: %w", err)
 	}
 
 	slog.Info("Created Monkey ERC1155 Transfer operator", "signersCount", len(senders))
-
-	err = monkeyTransferOperator.Run(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to run monkey skyweaver transfer operator: %w", err)
+	if err = monkeyTransferOperator.Run(ctx); err != nil {
+		return nil, fmt.Errorf("failed to run monkey ERC1155 transfer operator: %w", err)
 	}
-
-	slog.Info("Monkey Skyweaver Transfer operator started")
-	go func() {
-		err := server.Mine()
-		if err != nil {
-			slog.Error("Failed to mine block after starting monkey transfer operator", "error", err)
-			return
-		}
-
-		time.Sleep(10 * time.Second) // Allow some time for the operator to start
-		// print balances of the minted tokens for each signer
-		{
-			tokenBalances := make(map[common.Address]*big.Int)
-			for _, signer := range senders {
-				var balance *big.Int
-				err := server.ContractCall(
-					ctx,
-					erc1155Contract,
-					&balance,
-					"balanceOf",
-					signer.Address(), // owner
-					tokenID,          // tokenId
-				)
-				if err != nil {
-					slog.Error("Failed to get balance for signer", "signer", signer.Address().Hex(), "error", err)
-					continue
-				}
-				tokenBalances[signer.Address()] = balance
-
-				slog.Info("Minted ERC1155 tokens", "signer", signer.Address().Hex(), "balance", balance.String())
-			}
-		}
-	}()
+	slog.Info("Monkey ERC1155 Transfer operator started")
 
 	return monkeyTransferOperator, nil
 }
 
-func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTestServer, monkeySigners []*ethtestserver.Signer) (*ethtestserver.MonkeyOperator, error) {
+// runMonkeyERC20Transferors deploys an ERC20 contract, mints tokens for each
+// sender, and sets up a monkey operator to transfer tokens between senders and
+// recipients.
+func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTestServer, senders []*ethtestserver.Signer, recipients []*ethtestserver.Signer) (*ethtestserver.MonkeyOperator, error) {
 	slog.Info("Deploying ERC20 contract for monkey transfers")
+	contractDeployer := senders[0]
 
-	// Deploy ERC20 contract using the first signer from the given slice.
-	contractDeployer := monkeySigners[0]
+	contractRecipient := senders[0]
+	contractInitialOwner := senders[0]
 
 	erc20Contract, err := server.DeployContract(
 		ctx,
 		contractDeployer,
 		ERC20TestTokenArtifact.ContractName,
-		contractDeployer.Address(),
+		contractRecipient.Address(),
+		contractInitialOwner.Address(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to deploy ERC20 contract: %w", err)
 	}
 
-	// Use a small pool of signers to mint ERC20 tokens.
-	senders := monkeySigners[1:10]
-	mintAmount := big.NewInt(1000) // mint 1000 tokens
-
-	for _, sender := range senders {
+	mintAmount := big.NewInt(1000)
+	// Mint ERC20 tokens to each sender.
+	for _, s := range senders {
 		err = server.ContractTransact(
 			ctx,
-			contractDeployer,
+			contractInitialOwner,
 			erc20Contract,
 			"mint",
-			sender.Address(),
+			s.Address(),
 			mintAmount,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("failed to mint ERC20 tokens for %s: %w", sender.Address().Hex(), err)
+			return nil, fmt.Errorf("failed to mint ERC20 tokens for %s: %w", s.Address().Hex(), err)
 		}
-	}
-
-	// Optionally, print ERC20 balances.
-	for _, sender := range senders {
-		var balance *big.Int
-		err := server.ContractCall(
-			ctx,
-			erc20Contract,
-			&balance,
-			"balanceOf",
-			sender.Address(),
-		)
-		if err != nil {
-			slog.Error("Failed to get ERC20 balance", "signer", sender.Address().Hex(), "error", err)
-			continue
-		}
-		slog.Info("Minted ERC20 tokens", "signer", sender.Address().Hex(), "balance", balance.String())
 	}
 
 	monkeyERC20Doer := ethtestserver.NewMonkeyDoer(
 		func(ctx context.Context, op *ethtestserver.MonkeyOperator, gen *core.BlockGen) (*types.Transaction, error) {
-			// Pick two random signers from the pool.
-			signers, err := op.PickSigners(2)
-			if err != nil {
-				return nil, fmt.Errorf("failed to pick signers for monkey ERC20 transfer: %w", err)
-			}
-
-			sender, recipient := signers[0], signers[1]
+			sender := ethtestserver.PickRandomSigner(senders)
+			recipient := ethtestserver.PickRandomSigner(recipients)
 			transferAmount := big.NewInt(1) // Transfer 1 token
+
+			slog.Debug("ERC20 transfer",
+				"sender", sender.Address().Hex(),
+				"recipient", recipient.Address().Hex(),
+				"amount", transferAmount.String(),
+			)
 
 			calldata, err := erc20Contract.ABI.Pack("transfer", recipient.Address(), transferAmount)
 			if err != nil {
@@ -297,7 +230,6 @@ func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTes
 
 			nonce := gen.TxNonce(sender.Address())
 			gasLimit := uint64(100_000)
-
 			tx := types.NewTransaction(
 				nonce,
 				common.Address(erc20Contract.Address),
@@ -307,8 +239,7 @@ func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTes
 				calldata,
 			)
 
-			signer := types.HomesteadSigner{}
-			signedTx, err := types.SignTx(tx, signer, sender.RawPrivateKey())
+			signedTx, err := types.SignTx(tx, txSigner, sender.RawPrivateKey())
 			if err != nil {
 				return nil, fmt.Errorf("failed to sign ERC20 transfer transaction: %w", err)
 			}
@@ -317,18 +248,19 @@ func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTes
 		},
 	)
 
-	monkeyTransferOperator, err := ethtestserver.NewMonkeyOperator(&ethtestserver.MonkeyOperatorConfig{
-		Signers: senders,
-		Ticks:   100,
-	}, monkeyERC20Doer, server)
+	monkeyTransferOperator, err := ethtestserver.NewMonkeyOperator(
+		&ethtestserver.MonkeyOperatorConfig{
+			Signers: senders,
+		},
+		monkeyERC20Doer,
+		server,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create monkey ERC20 transfer operator: %w", err)
 	}
 
 	slog.Info("Created Monkey ERC20 Transfer operator", "signersCount", len(senders))
-
-	err = monkeyTransferOperator.Run(ctx)
-	if err != nil {
+	if err = monkeyTransferOperator.Run(ctx); err != nil {
 		return nil, fmt.Errorf("failed to run monkey ERC20 transfer operator: %w", err)
 	}
 
@@ -336,11 +268,12 @@ func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTes
 	return monkeyTransferOperator, nil
 }
 
-func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTestServer, monkeySigners []*ethtestserver.Signer) (*ethtestserver.MonkeyOperator, error) {
+// runMonkeyERC721Transferors deploys an ERC721 contract, mints tokens for each
+// sender, and sets up a monkey operator to transfer these tokens between
+// senders and recipients.
+func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTestServer, senders []*ethtestserver.Signer, recipients []*ethtestserver.Signer) (*ethtestserver.MonkeyOperator, error) {
 	slog.Info("Deploying ERC721 contract for monkey transfers")
-
-	// Deploy ERC721 contract using the first signer from the given slice.
-	contractDeployer := monkeySigners[0]
+	contractDeployer := senders[0]
 
 	erc721Contract, err := server.DeployContract(
 		ctx,
@@ -352,44 +285,35 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 		return nil, fmt.Errorf("failed to deploy ERC721 contract: %w", err)
 	}
 
-	// Use a small pool of signers for minting.
-	senders := monkeySigners[1:10]
-	// Create a mapping to track which tokenID was minted for which signer.
+	// Map each sender's address to its minted tokenID.
 	tokenMapping := make(map[common.Address]*big.Int)
-
-	// For each signer in the pool mint a unique NFT (tokenID = i+1)
-	for i, sender := range senders {
+	for i, s := range senders {
 		tokenID := big.NewInt(int64(i + 1))
 		err = server.ContractTransact(
 			ctx,
 			contractDeployer,
 			erc721Contract,
 			"mint",
-			sender.Address(),
+			s.Address(),
 			tokenID,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("failed to mint ERC721 token for %s: %w", sender.Address().Hex(), err)
+			return nil, fmt.Errorf("failed to mint ERC721 token for %s: %w", s.Address().Hex(), err)
 		}
-		tokenMapping[sender.Address()] = tokenID
-		slog.Info("Minted ERC721 token", "signer", sender.Address().Hex(), "tokenID", tokenID.String())
+		tokenMapping[s.Address()] = tokenID
+		slog.Info("Minted ERC721 token", "signer", s.Address().Hex(), "tokenID", tokenID.String())
 	}
 
 	monkeyERC721Doer := ethtestserver.NewMonkeyDoer(
 		func(ctx context.Context, op *ethtestserver.MonkeyOperator, gen *core.BlockGen) (*types.Transaction, error) {
-			// Pick two random signers from the pool.
-			signers, err := op.PickSigners(2)
-			if err != nil {
-				return nil, fmt.Errorf("failed to pick signers for monkey ERC721 transfer: %w", err)
-			}
+			sender := ethtestserver.PickRandomSigner(senders)
+			recipient := ethtestserver.PickRandomSigner(recipients)
 
-			sender, recipient := signers[0], signers[1]
 			tokenID, ok := tokenMapping[sender.Address()]
 			if !ok {
 				return nil, fmt.Errorf("sender %s does not own a minted ERC721 token", sender.Address().Hex())
 			}
 
-			// Pack call data for safeTransferFrom (ERC721 standard with 3 parameters).
 			calldata, err := erc721Contract.ABI.Pack("safeTransferFrom", sender.Address(), recipient.Address(), tokenID)
 			if err != nil {
 				return nil, fmt.Errorf("failed to pack ERC721 safeTransferFrom call: %w", err)
@@ -397,7 +321,6 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 
 			nonce := gen.TxNonce(sender.Address())
 			gasLimit := uint64(150_000)
-
 			tx := types.NewTransaction(
 				nonce,
 				common.Address(erc721Contract.Address),
@@ -407,8 +330,7 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 				calldata,
 			)
 
-			signer := types.HomesteadSigner{}
-			signedTx, err := types.SignTx(tx, signer, sender.RawPrivateKey())
+			signedTx, err := types.SignTx(tx, txSigner, sender.RawPrivateKey())
 			if err != nil {
 				return nil, fmt.Errorf("failed to sign ERC721 transfer transaction: %w", err)
 			}
@@ -417,18 +339,19 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 		},
 	)
 
-	monkeyTransferOperator, err := ethtestserver.NewMonkeyOperator(&ethtestserver.MonkeyOperatorConfig{
-		Signers: senders,
-		Ticks:   100,
-	}, monkeyERC721Doer, server)
+	monkeyTransferOperator, err := ethtestserver.NewMonkeyOperator(
+		&ethtestserver.MonkeyOperatorConfig{
+			Signers: senders,
+		},
+		monkeyERC721Doer,
+		server,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create monkey ERC721 transfer operator: %w", err)
 	}
 
 	slog.Info("Created Monkey ERC721 Transfer operator", "signersCount", len(senders))
-
-	err = monkeyTransferOperator.Run(ctx)
-	if err != nil {
+	if err = monkeyTransferOperator.Run(ctx); err != nil {
 		return nil, fmt.Errorf("failed to run monkey ERC721 transfer operator: %w", err)
 	}
 
