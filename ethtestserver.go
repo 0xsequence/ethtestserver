@@ -63,7 +63,8 @@ type ETHTestServerConfig struct {
 	ChainID *big.Int // Chain ID for the test server
 	DataDir string   // Directory to store the blockchain data
 
-	InitialSigners   map[common.Address]*big.Int // Initial account balances for the test server
+	InitialSigners   []*Signer                   // Initial signers for the test server
+	InitialBalances  map[common.Address]*big.Int // Initial account balances for the test server
 	InitialContracts map[common.Address][]byte   // Deployed bytecode-only contracts
 	InitialBlockNum  uint64                      // Initial block number for the test server
 	InitialTimestamp uint64                      // Initial timestamp for the test server
@@ -109,7 +110,12 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	}
 
 	config.Genesis.Alloc = make(types.GenesisAlloc)
-	for addr, balance := range config.InitialSigners {
+	for _, signer := range config.InitialSigners {
+		addr := signer.Address()
+		balance, ok := config.InitialBalances[addr]
+		if !ok {
+			continue // Skip if no balance is set for this address
+		}
 		config.Genesis.Alloc[addr] = types.Account{
 			Balance: balance,
 		}

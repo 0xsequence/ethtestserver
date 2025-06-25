@@ -15,31 +15,37 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 )
 
-func runMonkeyTransferors(ctx context.Context, server *ethtestserver.ETHTestServer, monkeySigners []*ethtestserver.Signer) (*ethtestserver.MonkeyOperator, error) {
-	// Monkey transferer
+var txSigner = types.HomesteadSigner{}
+
+func runMonkeyTransferors(ctx context.Context, server *ethtestserver.ETHTestServer, senders []*ethtestserver.Signer, recipients []*ethtestserver.Signer) (*ethtestserver.MonkeyOperator, error) {
+	// Monkey transferor
 	monkeyTransferor := ethtestserver.NewMonkeyDoer(
 		func(ctx context.Context, op *ethtestserver.MonkeyOperator, gen *core.BlockGen) (*types.Transaction, error) {
 
-			signers, err := op.PickSigners(2) // Pick 2 random signers for the transfer
-			if err != nil {
-				return nil, fmt.Errorf("failed to pick signers for monkey transfer: %w", err)
-			}
+			sender := ethtestserver.PickRandomSigner(senders)
+			recipient := ethtestserver.PickRandomSigner(recipients)
 
-			addr1 := signers[0].Address()
-			addr2 := signers[1].Address()
+			amount := ethtestserver.PickRandomAmount(1, 100)
 
-			signer := types.HomesteadSigner{}
+			slog.Debug("ETH transfer",
+				"sender", sender.Address().Hex(),
+				"recipient", recipient.Address().Hex(),
+				"amount", amount.String(),
+			)
+
+			nonce := gen.TxNonce(sender.Address())
+
 			tx, _ := types.SignTx(
 				types.NewTransaction(
-					gen.TxNonce(addr1),
-					addr2,
-					big.NewInt(1),
+					nonce,
+					recipient.Address(),
+					amount,
 					params.TxGas,
 					big.NewInt(params.InitialBaseFee),
 					nil,
 				),
-				signer,
-				signers[0].RawPrivateKey(),
+				txSigner,
+				sender.RawPrivateKey(),
 			)
 
 			return tx, nil
@@ -47,9 +53,8 @@ func runMonkeyTransferors(ctx context.Context, server *ethtestserver.ETHTestServ
 	)
 
 	// Random ETH transfers using monkey signers
-	monkeyTransferOperator, err := ethtestserver.NewMonkeyOperator(&ethtestserver.MonkeyOperatorConfig{
-		Signers: monkeySigners[:20],
-	},
+	monkeyTransferOperator, err := ethtestserver.NewMonkeyOperator(
+		nil,
 		monkeyTransferor,
 		server,
 	)

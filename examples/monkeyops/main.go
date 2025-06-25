@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log"
 	"log/slog"
 	"math/big"
 	"os"
@@ -35,12 +36,27 @@ func main() {
 		initialBalance = big.NewInt(1e18)
 	)
 
+	// list of known wallets
+	knownWallets := []*ethtestserver.Signer{
+		wallet0,
+		wallet1,
+		wallet2,
+		wallet3,
+		wallet4,
+		wallet5,
+		wallet6,
+		wallet7,
+		wallet8,
+		wallet9,
+	}
+
 	config := &ethtestserver.ETHTestServerConfig{
-		AutoMining: true,
-		MineRate:   time.Millisecond * 1000,
-		HTTPHost:   "localhost",
-		HTTPPort:   19997,
-		InitialSigners: map[common.Address]*big.Int{
+		AutoMining:     true,
+		MineRate:       time.Millisecond * 1000,
+		HTTPHost:       "localhost",
+		HTTPPort:       19997,
+		InitialSigners: knownWallets,
+		InitialBalances: map[common.Address]*big.Int{
 			wallet0.Address(): initialBalance,
 			wallet1.Address(): initialBalance,
 			wallet2.Address(): initialBalance,
@@ -59,12 +75,16 @@ func main() {
 		},
 	}
 
+	// generate a large number of additional monkey signers
 	monkeySigners := ethtestserver.GenSigners(500)
 
-	// add monkey signers to the config
+	// add monkey signers to the config so they can be used in the test server
 	for _, signer := range monkeySigners {
-		config.InitialSigners[signer.Address()] = initialBalance
+		config.InitialSigners = append(config.InitialSigners, signer)
+		config.InitialBalances[signer.Address()] = initialBalance
 	}
+
+	allSigners := append(knownWallets, monkeySigners...)
 
 	server, err := ethtestserver.NewETHTestServer(config)
 	if err != nil {
@@ -77,63 +97,51 @@ func main() {
 
 	err = server.Run(ctx)
 	if err != nil {
-		slog.Error("Failed to run test server", "error", err)
-		return
+		log.Fatalf("Failed to run test server: %v", err)
 	}
 	defer server.Stop(ctx)
 
-	slog.Info("Test server started successfully", "endpoint", server.HTTPEndpoint())
+	slog.Info("ETH Test server started successfully", "endpoint", server.HTTPEndpoint())
+	go printStatus(ctx, server)
 
-	// run monkey transferers for native ETH
-	monkeyTransferor, err := runMonkeyTransferors(ctx, server, monkeySigners[0:100])
+	// run monkey transferors for native ETH
+	monkeyTransferor, err := runMonkeyTransferors(ctx, server, allSigners, allSigners)
 	if err != nil {
-		slog.Error("Failed to run monkey transferers", "error", err)
+		slog.Error("Failed to run monkey transferors", "error", err)
 		return
 	}
 	defer monkeyTransferor.Stop(ctx)
-	slog.Info("Monkey transferer started successfully", "signersCount", len(monkeySigners[0:100]))
 
-	// run monkey transferers for ERC1155
-	monkeyERC1155Transferor, err := runMonkeyERC1155Transferors(ctx, server, monkeySigners[101:200])
-	if err != nil {
-		slog.Error("Failed to run monkey ERC1155 transferers", "error", err)
-		return
-	}
-	defer monkeyERC1155Transferor.Stop(ctx)
-	slog.Info("Monkey ERC1155 transferer started successfully", "signersCount", len(monkeySigners[100:200]))
-
-	// run monkey transferers for ERC20
-	monkeyERC20Transferor, err := runMonkeyERC20Transferors(ctx, server, monkeySigners[201:211])
-	if err != nil {
-		slog.Error("Failed to run monkey ERC20 transferors", "error", err)
-		return
-	}
-	defer monkeyERC20Transferor.Stop(ctx)
-	slog.Info("Monkey ERC20 transferor started successfully", "signersCount", len(monkeySigners[201:211]))
-
-	// run monkey transferers for ERC721
-	monkeyERC721Transferor, err := runMonkeyERC721Transferors(ctx, server, monkeySigners[211:221])
-	if err != nil {
-		slog.Error("Failed to run monkey ERC721 transferors", "error", err)
-		return
-	}
-	defer monkeyERC721Transferor.Stop(ctx)
-	slog.Info("Monkey ERC721 transferor started successfully", "signersCount", len(monkeySigners[211:221]))
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				slog.Info("Stopping status printing goroutine")
-				return
-			default:
-			}
-			server.PrintStatus()
-			time.Sleep(10 * time.Second) // Print status every 10 seconds
+	/*
+		// run monkey transferors for ERC1155
+		monkeyERC1155Transferor, err := runMonkeyERC1155Transferors(ctx, server, monkeySigners[101:200])
+		if err != nil {
+			slog.Error("Failed to run monkey ERC1155 transferors", "error", err)
+			return
 		}
-	}()
+		defer monkeyERC1155Transferor.Stop(ctx)
+		slog.Info("Monkey ERC1155 transferor started successfully", "signersCount", len(monkeySigners[100:200]))
 
-	time.Sleep(24 * time.Hour) // Run the test for 24 hours
+		// run monkey transferors for ERC20
+		monkeyERC20Transferor, err := runMonkeyERC20Transferors(ctx, server, monkeySigners[201:211])
+		if err != nil {
+			slog.Error("Failed to run monkey ERC20 transferors", "error", err)
+			return
+		}
+		defer monkeyERC20Transferor.Stop(ctx)
+		slog.Info("Monkey ERC20 transferor started successfully", "signersCount", len(monkeySigners[201:211]))
+
+		// run monkey transferors for ERC721
+		monkeyERC721Transferor, err := runMonkeyERC721Transferors(ctx, server, monkeySigners[211:221])
+		if err != nil {
+			slog.Error("Failed to run monkey ERC721 transferors", "error", err)
+			return
+		}
+		defer monkeyERC721Transferor.Stop(ctx)
+		slog.Info("Monkey ERC721 transferor started successfully", "signersCount", len(monkeySigners[211:221]))
+	*/
+
+	<-ctx.Done()
 	slog.Info("Test run completed, stopping server")
 
 	err = server.Stop(ctx)
@@ -141,5 +149,18 @@ func main() {
 		slog.Error("Failed to stop test server", "error", err)
 		os.Exit(1)
 		return
+	}
+}
+
+func printStatus(ctx context.Context, server *ethtestserver.ETHTestServer) {
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("Stopping status printing goroutine")
+			return
+		default:
+		}
+		server.PrintStatus()
+		time.Sleep(10 * time.Second) // Print status every 10 seconds
 	}
 }
