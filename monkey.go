@@ -64,7 +64,7 @@ type MonkeyBlockAdder interface {
 
 var (
 	defaultMonkeyOperatorTickerInterval       = 100 * time.Millisecond // Default interval for executing operations
-	defaultMonkeyOperatorTransactionsPerBlock = 5                      // Default transactions per block
+	defaultMonkeyOperatorTransactionsPerBlock = 20                     // Default transactions per block
 )
 
 type MonkeyOperatorConfig struct {

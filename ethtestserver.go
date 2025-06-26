@@ -22,7 +22,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth"
 	"github.com/ethereum/go-ethereum/eth/catalyst"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
@@ -36,7 +35,6 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/ethereum/go-ethereum/triedb"
-	//spew "github.com/davecgh/go-spew/spew"
 )
 
 type ETHContractCaller struct {
@@ -57,6 +55,7 @@ type ETHTestServer struct {
 	db     ethdb.Database   // Database used by the test server
 
 	provider atomic.Value // Provider for the test server, initialized lazily
+	genesis  *types.Block // Genesis block of the test server
 
 	beacon *catalyst.SimulatedBeacon
 }
@@ -110,11 +109,17 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	if config.Genesis.Config == nil {
 		config.Genesis.Config = params.AllDevChainProtocolChanges
 	}
+
 	if config.Genesis.GasLimit == 0 {
-		config.Genesis.GasLimit = params.GenesisGasLimit
+		config.Genesis.GasLimit = 5_000_000
 	}
+
 	if config.Genesis.BaseFee == nil {
 		config.Genesis.BaseFee = big.NewInt(params.InitialBaseFee)
+	}
+
+	if config.Genesis.Difficulty == nil {
+		config.Genesis.Difficulty = common.Big1 // Default difficulty for the genesis block
 	}
 
 	config.Genesis.Alloc = make(types.GenesisAlloc)
@@ -158,8 +163,8 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	config.NodeConfig.HTTPHost = config.HTTPHost
 	config.NodeConfig.HTTPPort = config.HTTPPort
 	config.NodeConfig.HTTPModules = []string{"eth", "net", "web3", "txpool"}
-	config.NodeConfig.DataDir = config.DataDir
 	config.NodeConfig.Logger = log.NewLogger(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	config.NodeConfig.DataDir = config.DataDir
 
 	stack, err := node.New(config.NodeConfig)
 	if err != nil {
@@ -193,10 +198,7 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	triedb := triedb.NewDatabase(db, triedb.HashDefaults)
 	defer triedb.Close()
 
-	_, err = config.Genesis.Commit(db, triedb)
-	if err != nil {
-		return nil, fmt.Errorf("failed to commit genesis block: %w", err)
-	}
+	genesis := config.Genesis.MustCommit(db, triedb)
 
 	service, err := eth.New(stack, config.ServiceConfig)
 	if err != nil {
@@ -236,6 +238,7 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		node:     stack,
 		ethereum: service,
 		beacon:   simBeacon,
+		genesis:  genesis,
 
 		db:     db,
 		engine: engine,
@@ -399,8 +402,8 @@ func (s *ETHTestServer) DeployContract(ctx context.Context, signer *Signer, cont
 		return nil, fmt.Errorf("contract %s not found in registry", contractName)
 	}
 
-	data := make([]byte, len(artifact.Bin))
-	copy(data, artifact.Bin)
+	calldata := make([]byte, len(artifact.Bin))
+	copy(calldata, artifact.Bin)
 
 	var input []byte
 	var err error
@@ -413,22 +416,17 @@ func (s *ETHTestServer) DeployContract(ctx context.Context, signer *Signer, cont
 		return nil, fmt.Errorf("contract constructor pack failed: %w", err)
 	}
 
-	var contractAddr common.Address
-
-	data = append(data, input...)
+	calldata = append(calldata, input...)
 
 	_, receipts, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) {
 		nonce := gen.TxNonce(signer.Address())
 
-		contractAddr = crypto.CreateAddress(signer.Address(), nonce)
-
-		tx := types.NewTransaction(
+		tx := types.NewContractCreation(
 			nonce,
-			contractAddr, // Contract address
-			nil,          // value
-			1_000_000,
-			gen.BaseFee(), // Base fee
-			data,          // Contract bytecode and constructor calldata
+			new(big.Int),
+			3_000_000, // Gas limit
+			gen.BaseFee(),
+			calldata, // Contract bytecode and constructor calldata
 		)
 
 		signedTxn, err := types.SignTx(tx, gen.Signer(), signer.RawPrivateKey())
@@ -448,12 +446,17 @@ func (s *ETHTestServer) DeployContract(ctx context.Context, signer *Signer, cont
 	}
 
 	receipt := receipts[0][0]
+
 	if receipt.Status != types.ReceiptStatusSuccessful {
 		return nil, fmt.Errorf("contract deployment failed with status: %d", receipt.Status)
 	}
 
+	if receipt.ContractAddress == (common.Address{}) {
+		return nil, fmt.Errorf("contract deployment failed, address is empty")
+	}
+
 	return &ETHContractCaller{
-		Address: contractAddr,
+		Address: receipt.ContractAddress,
 		ABI:     artifact.ABI,
 	}, nil
 }

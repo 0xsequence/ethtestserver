@@ -52,9 +52,8 @@ func main() {
 
 	config := &ethtestserver.ETHTestServerConfig{
 		AutoMining:     true,
-		MineRate:       time.Millisecond * 100,
 		HTTPHost:       "localhost",
-		HTTPPort:       19997,
+		HTTPPort:       8585,
 		InitialSigners: knownWallets,
 		InitialBalances: map[common.Address]*big.Int{
 			wallet0.Address(): initialBalance,
@@ -84,8 +83,6 @@ func main() {
 		config.InitialBalances[signer.Address()] = initialBalance
 	}
 
-	allSigners := append(knownWallets, monkeySigners...)
-
 	server, err := ethtestserver.NewETHTestServer(config)
 	if err != nil {
 		slog.Error("Failed to create test server", "error", err)
@@ -106,7 +103,7 @@ func main() {
 
 	// run monkey transferors for native ETH
 	go func() {
-		monkeyTransferor, err := runMonkeyTransferors(ctx, server, allSigners, allSigners)
+		monkeyTransferor, err := runMonkeyTransferors(ctx, server, knownWallets, knownWallets)
 		if err != nil {
 			slog.Error("Failed to run monkey transferors", "error", err)
 			return

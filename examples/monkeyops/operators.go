@@ -26,7 +26,7 @@ func runMonkeyTransferors(ctx context.Context, server *ethtestserver.ETHTestServ
 
 			nonce := gen.TxNonce(sender.Address())
 
-			slog.Debug("ETH transfer",
+			slog.Info("ETH transfer",
 				"sender", sender.Address().Hex(),
 				"recipient", recipient.Address().Hex(),
 				"amount", amount.String(),
@@ -54,7 +54,7 @@ func runMonkeyTransferors(ctx context.Context, server *ethtestserver.ETHTestServ
 	)
 
 	monkeyTransferOperator, err := ethtestserver.NewMonkeyOperator(
-		nil,
+		&ethtestserver.MonkeyOperatorConfig{},
 		monkeyTransferor,
 		server,
 	)
