@@ -130,7 +130,7 @@ func main() {
 
 	// run monkey transferors for ERC20
 	go func() {
-		monkeyERC20Transferor, err := runMonkeyERC20Transferors(ctx, server, knownWallets, knownWallets)
+		monkeyERC20Transferor, err := runMonkeyERC20Transferors(ctx, server, knownWallets, knownWallets, 10_000)
 		if err != nil {
 			slog.Error("Failed to run monkey ERC20 transferors", "error", err)
 			return
@@ -142,7 +142,7 @@ func main() {
 
 	// run monkey transferors for ERC721
 	go func() {
-		monkeyERC721Transferor, err := runMonkeyERC721Transferors(ctx, server, knownWallets, knownWallets)
+		monkeyERC721Transferor, err := runMonkeyERC721Transferors(ctx, server, knownWallets, knownWallets, 256)
 		if err != nil {
 			slog.Error("Failed to run monkey ERC721 transferors", "error", err)
 			return

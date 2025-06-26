@@ -29,6 +29,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth/filters"
 	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/node"
@@ -63,6 +64,9 @@ type ETHTestServer struct {
 type ETHTestServerConfig struct {
 	AutoMining bool          // Whether to enable mining on the test server
 	MineRate   time.Duration // How often to mine a new block
+
+	MinBlockNum uint64 // Minimum block number for the test server, defaults to 1
+	MaxBlockNum uint64 // Maximum block number for the test server, defaults to unlimited
 
 	ChainID *big.Int // Chain ID for the test server
 	DataDir string   // Directory to store the blockchain data
@@ -135,14 +139,16 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		config.HTTPPort = 0
 	}
 
-	if config.DataDir == "" {
-		tmpdir, err := os.MkdirTemp("", "eth-test-server-")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create temporary data directory: %w", err)
-		}
+	/*
+		if config.DataDir == "" {
+			tmpdir, err := os.MkdirTemp("", "eth-test-server-")
+			if err != nil {
+				return nil, fmt.Errorf("failed to create temporary data directory: %w", err)
+			}
 
-		config.DataDir = tmpdir
-	}
+			config.DataDir = tmpdir
+		}
+	*/
 
 	if config.NodeConfig == nil {
 		config.NodeConfig = &node.Config{}
@@ -170,13 +176,19 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	config.ServiceConfig.HistoryMode = history.KeepAll
 	config.ServiceConfig.FilterLogCacheSize = 1000
 
-	// initialize database
-	pdb, err := pebble.New(config.DataDir, 128, 128, "", false, false)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Pebble database: %w", err)
-	}
+	var db ethdb.Database
 
-	db := rawdb.NewDatabase(pdb)
+	// initialize database
+	if config.DataDir != "" {
+		pdb, err := pebble.New(config.DataDir, 128, 128, "", false, false)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Pebble database: %w", err)
+		}
+		db = rawdb.NewDatabase(pdb)
+	} else {
+		mdb := memorydb.New()
+		db = rawdb.NewDatabase(mdb)
+	}
 
 	triedb := triedb.NewDatabase(db, triedb.HashDefaults)
 	defer triedb.Close()
@@ -305,6 +317,7 @@ func (s *ETHTestServer) Stop(ctx context.Context) error {
 		}
 		s.node = nil
 	}
+
 	if s.beacon != nil {
 		err := s.beacon.Stop()
 		if err != nil {
@@ -312,6 +325,7 @@ func (s *ETHTestServer) Stop(ctx context.Context) error {
 		}
 		s.beacon = nil
 	}
+
 	if s.config.DataDir != "" {
 		err := os.RemoveAll(s.config.DataDir)
 		if err != nil {
@@ -319,6 +333,7 @@ func (s *ETHTestServer) Stop(ctx context.Context) error {
 		}
 		s.config.DataDir = ""
 	}
+
 	return nil
 }
 

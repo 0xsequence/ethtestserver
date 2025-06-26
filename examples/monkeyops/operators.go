@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"math/rand"
 
 	"github.com/0xsequence/ethtestserver"
 
@@ -25,7 +26,7 @@ func runMonkeyTransferors(ctx context.Context, server *ethtestserver.ETHTestServ
 
 			nonce := gen.TxNonce(sender.Address())
 
-			slog.Info("ETH transfer",
+			slog.Debug("ETH transfer",
 				"sender", sender.Address().Hex(),
 				"recipient", recipient.Address().Hex(),
 				"amount", amount.String(),
@@ -175,7 +176,7 @@ func runMonkeyERC1155Transferors(ctx context.Context, server *ethtestserver.ETHT
 // runMonkeyERC20Transferors deploys an ERC20 contract, mints tokens for each
 // sender, and sets up a monkey operator to transfer tokens between senders and
 // recipients.
-func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTestServer, senders []*ethtestserver.Signer, recipients []*ethtestserver.Signer) (*ethtestserver.MonkeyOperator, error) {
+func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTestServer, senders []*ethtestserver.Signer, recipients []*ethtestserver.Signer, mintAmount int) (*ethtestserver.MonkeyOperator, error) {
 	slog.Info("Deploying ERC20 contract for monkey transfers")
 	contractDeployer := senders[0]
 
@@ -193,7 +194,6 @@ func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTes
 		return nil, fmt.Errorf("failed to deploy ERC20 contract: %w", err)
 	}
 
-	mintAmount := big.NewInt(1000)
 	// Mint ERC20 tokens to each sender.
 	for _, s := range senders {
 		err = server.ContractTransact(
@@ -202,7 +202,7 @@ func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTes
 			erc20Contract,
 			"mint",
 			s.Address(),
-			mintAmount,
+			big.NewInt(int64(mintAmount)),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to mint ERC20 tokens for %s: %w", s.Address().Hex(), err)
@@ -269,9 +269,9 @@ func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTes
 // runMonkeyERC721Transferors deploys an ERC721 contract, mints tokens for each
 // sender, and sets up a monkey operator to transfer these tokens between
 // senders and recipients.
-func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTestServer, senders []*ethtestserver.Signer, recipients []*ethtestserver.Signer) (*ethtestserver.MonkeyOperator, error) {
+func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTestServer, senders []*ethtestserver.Signer, recipients []*ethtestserver.Signer, mintedTokens int) (*ethtestserver.MonkeyOperator, error) {
 	slog.Info("Deploying ERC721 contract for monkey transfers")
-	contractDeployer := senders[0]
+	contractDeployer := ethtestserver.PickRandomSigner(senders)
 
 	erc721Contract, err := server.DeployContract(
 		ctx,
@@ -283,36 +283,66 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 		return nil, fmt.Errorf("failed to deploy ERC721 contract: %w", err)
 	}
 
-	// Map each sender's address to its minted tokenID.
-	tokenMapping := make(map[common.Address]*big.Int)
-	for i, s := range senders {
-		tokenID := big.NewInt(int64(i + 1))
-		err = server.ContractTransact(
-			ctx,
-			contractDeployer,
-			erc721Contract,
-			"mint",
-			s.Address(),
-			tokenID,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to mint ERC721 token for %s: %w", s.Address().Hex(), err)
+	// Mapping of addresses to token IDs
+	tokenMapping := make(map[common.Address][]uint64)
+
+	var nextTokenID uint64
+
+	for i := 0; i < mintedTokens; i++ {
+		for _, s := range senders {
+			senderAddr := s.Address()
+
+			if _, exists := tokenMapping[senderAddr]; !exists {
+				tokenMapping[senderAddr] = []uint64{}
+			}
+
+			nextTokenID = uint64(i + 1)
+
+			err = server.ContractTransact(
+				ctx,
+				contractDeployer,
+				erc721Contract,
+				"safeMint",
+				s.Address(),
+				big.NewInt(int64(nextTokenID)),
+			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to mint ERC721 token for %s: %w", s.Address().Hex(), err)
+			}
+
+			slog.Info("Minted ERC721 token",
+				"contract", erc721Contract.Address.Hex(),
+				"recipient", s.Address().Hex(),
+				"tokenID", nextTokenID,
+			)
+
+			tokenMapping[senderAddr] = append(tokenMapping[senderAddr], nextTokenID)
 		}
-		tokenMapping[s.Address()] = tokenID
-		slog.Info("Minted ERC721 token", "signer", s.Address().Hex(), "tokenID", tokenID.String())
 	}
 
 	monkeyERC721Doer := ethtestserver.NewMonkeyDoer(
 		func(ctx context.Context, op *ethtestserver.MonkeyOperator, gen *core.BlockGen) (*types.Transaction, error) {
 			sender := ethtestserver.PickRandomSigner(senders)
-			recipient := ethtestserver.PickRandomSigner(recipients)
+			senderAddr := sender.Address()
 
-			tokenID, ok := tokenMapping[sender.Address()]
-			if !ok {
-				return nil, fmt.Errorf("sender %s does not own a minted ERC721 token", sender.Address().Hex())
+			if len(tokenMapping[senderAddr]) == 0 {
+				slog.Debug("No tokens available for transfer", "sender", senderAddr.Hex())
+				return nil, nil
 			}
 
-			calldata, err := erc721Contract.ABI.Pack("safeTransferFrom", sender.Address(), recipient.Address(), tokenID)
+			// pick a random recipient from the recipients pool
+			recipient := ethtestserver.PickRandomSigner(recipients)
+			recipientAddr := recipient.Address()
+
+			// pick a random token ID from the sender's tokens
+			tokenID := tokenMapping[senderAddr][rand.Intn(len(tokenMapping[senderAddr]))]
+
+			calldata, err := erc721Contract.ABI.Pack(
+				"safeTransferFrom",
+				sender.Address(),
+				recipient.Address(),
+				big.NewInt(int64(tokenID)),
+			)
 			if err != nil {
 				return nil, fmt.Errorf("failed to pack ERC721 safeTransferFrom call: %w", err)
 			}
@@ -332,6 +362,23 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 			if err != nil {
 				return nil, fmt.Errorf("failed to sign ERC721 transfer transaction: %w", err)
 			}
+
+			slog.Info("ERC721 transfer",
+				"sender", sender.Address().Hex(),
+				"recipient", recipient.Address().Hex(),
+				"tokenID", tokenID,
+			)
+
+			// remove the token from the sender's mapping
+			for i, id := range tokenMapping[senderAddr] {
+				if id == tokenID {
+					tokenMapping[senderAddr] = append(tokenMapping[senderAddr][:i], tokenMapping[senderAddr][i+1:]...)
+					break
+				}
+			}
+
+			// add the token to the recipient's mapping
+			tokenMapping[recipientAddr] = append(tokenMapping[recipientAddr], tokenID)
 
 			return signedTx, nil
 		},
