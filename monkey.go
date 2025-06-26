@@ -59,7 +59,7 @@ type MonkeyDoer interface {
 }
 
 type MonkeyBlockAdder interface {
-	GenBlocks(int, func(int, *core.BlockGen)) error
+	GenBlocks(int, func(int, *core.BlockGen)) ([]*types.Block, []types.Receipts, error)
 }
 
 var (
@@ -135,7 +135,7 @@ func (m *MonkeyOperator) Run(ctx context.Context) error {
 			case <-m.done:
 				return
 			case <-ticker.C:
-				err := m.blockAdder.GenBlocks(1, func(i int, gen *core.BlockGen) {
+				_, _, err := m.blockAdder.GenBlocks(1, func(i int, gen *core.BlockGen) {
 					for j := 0; j < m.config.TransactionsPerBlock; j++ {
 						tx, err := m.do(ctx, gen)
 						if err != nil {

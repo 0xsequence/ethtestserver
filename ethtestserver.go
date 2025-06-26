@@ -11,11 +11,8 @@ import (
 	"time"
 
 	"github.com/0xsequence/ethkit/ethartifact"
-	"github.com/0xsequence/ethkit/ethcontract"
-	"github.com/0xsequence/ethkit/ethrpc"
-	"github.com/0xsequence/ethkit/ethtest"
-	"github.com/0xsequence/ethkit/ethtxn"
-	"github.com/0xsequence/ethkit/ethwallet"
+	"github.com/0xsequence/ethkit/go-ethereum/accounts/abi"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/beacon"
@@ -25,6 +22,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth"
 	"github.com/ethereum/go-ethereum/eth/catalyst"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
@@ -37,7 +35,15 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/ethereum/go-ethereum/triedb"
+	//spew "github.com/davecgh/go-spew/spew"
 )
+
+var TxSigner = types.HomesteadSigner{}
+
+type ETHContractCaller struct {
+	Address common.Address // Address of the contract
+	ABI     abi.ABI
+}
 
 type ETHTestServer struct {
 	mu sync.Mutex
@@ -245,7 +251,7 @@ func (s *ETHTestServer) Run(ctx context.Context) error {
 	}
 
 	// add first empty block to initialize the blockchain
-	if err := s.GenBlocks(1, func(i int, gen *core.BlockGen) {}); err != nil {
+	if _, _, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) {}); err != nil {
 		return fmt.Errorf("ETHTestServer: failed to generate initial block: %w", err)
 	}
 
@@ -336,7 +342,7 @@ func (s *ETHTestServer) waitForTxIndexing() error {
 	return nil
 }
 
-func (s *ETHTestServer) GenBlocks(n int, gen func(int, *core.BlockGen)) error {
+func (s *ETHTestServer) GenBlocks(n int, gen func(int, *core.BlockGen)) ([]*types.Block, []types.Receipts, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -345,7 +351,7 @@ func (s *ETHTestServer) GenBlocks(n int, gen func(int, *core.BlockGen)) error {
 	latestBlockHeader := bc.CurrentBlock()
 	latestBlock := bc.GetBlock(latestBlockHeader.Hash(), latestBlockHeader.Number.Uint64())
 
-	blocks, _ := core.GenerateChain(
+	blocks, receipts := core.GenerateChain(
 		s.config.Genesis.Config,
 		latestBlock,
 		s.engine,
@@ -356,44 +362,14 @@ func (s *ETHTestServer) GenBlocks(n int, gen func(int, *core.BlockGen)) error {
 
 	_, err := bc.InsertChain(blocks)
 	if err != nil {
-		return fmt.Errorf("ETHTestServer: failed to insert blocks into blockchain: %w", err)
+		return nil, nil, fmt.Errorf("ETHTestServer: failed to insert blocks into blockchain: %w", err)
 	}
 
 	if err := s.waitForTxIndexing(); err != nil {
-		return fmt.Errorf("ETHTestServer: failed to wait for transaction indexing: %w", err)
+		return nil, nil, fmt.Errorf("ETHTestServer: failed to wait for transaction indexing: %w", err)
 	}
 
-	return nil
-}
-
-func (s *ETHTestServer) Provider() (*ethrpc.Provider, error) {
-	if p := s.provider.Load(); p != nil {
-		return p.(*ethrpc.Provider), nil
-	}
-
-	provider, err := ethrpc.NewProvider(s.HTTPEndpoint())
-	if err != nil {
-		return nil, fmt.Errorf("ETHTestServer: failed to create provider: %w", err)
-	}
-
-	s.provider.Store(provider)
-
-	return provider, nil
-}
-
-func (s *ETHTestServer) ETHKitWallet(wallet *Signer) (*ethwallet.Wallet, error) {
-	ethkitWallet, err := ethwallet.NewWalletFromPrivateKey(wallet.Key())
-	if err != nil {
-		return nil, fmt.Errorf("ETHTestServer: failed to create ETHKit wallet: %w", err)
-	}
-
-	provider, err := s.Provider()
-	if err != nil {
-		return nil, fmt.Errorf("ETHTestServer: failed to create provider: %w", err)
-	}
-
-	ethkitWallet.SetProvider(provider)
-	return ethkitWallet, nil
+	return blocks, receipts, nil
 }
 
 func (s *ETHTestServer) HTTPEndpoint() string {
@@ -404,12 +380,7 @@ func (s *ETHTestServer) HTTPEndpoint() string {
 	return s.node.HTTPEndpoint()
 }
 
-func (s *ETHTestServer) DeployContract(ctx context.Context, signer *Signer, contractName string, constructorArgs ...interface{}) (*ethcontract.Contract, error) {
-	provider, err := s.Provider()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create provider: %w", err)
-	}
-
+func (s *ETHTestServer) DeployContract(ctx context.Context, signer *Signer, contractName string, constructorArgs ...interface{}) (*ETHContractCaller, error) {
 	artifact, ok := s.artifacts.Get(contractName)
 	if !ok {
 		return nil, fmt.Errorf("contract %s not found in registry", contractName)
@@ -419,7 +390,7 @@ func (s *ETHTestServer) DeployContract(ctx context.Context, signer *Signer, cont
 	copy(data, artifact.Bin)
 
 	var input []byte
-	// encode constructor call
+	var err error
 	if len(constructorArgs) > 0 && len(artifact.ABI.Constructor.Inputs) > 0 {
 		input, err = artifact.ABI.Pack("", constructorArgs...)
 	} else {
@@ -429,39 +400,52 @@ func (s *ETHTestServer) DeployContract(ctx context.Context, signer *Signer, cont
 		return nil, fmt.Errorf("contract constructor pack failed: %w", err)
 	}
 
-	// append constructor calldata at end of the contract bin
+	var contractAddr common.Address
+
 	data = append(data, input...)
 
-	deployWallet, err := s.ETHKitWallet(signer)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create ETHKit wallet: %w", err)
-	}
+	_, receipts, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) {
+		nonce := gen.TxNonce(signer.Address())
 
-	signedTxn, err := deployWallet.NewTransaction(ctx, &ethtxn.TransactionRequest{
-		Data: data,
+		contractAddr = crypto.CreateAddress(signer.Address(), nonce)
+
+		tx := types.NewTransaction(
+			nonce,
+			contractAddr, // Contract address
+			nil,          // value
+			1_000_000,
+			gen.BaseFee(), // Base fee
+			data,          // Contract bytecode and constructor calldata
+		)
+
+		signedTxn, err := types.SignTx(tx, gen.Signer(), signer.RawPrivateKey())
+		if err != nil {
+			slog.Error("DeployContract: Failed to sign transaction", "error", err)
+			return
+		}
+
+		gen.AddTx(signedTxn)
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create transaction: %w", err)
+		return nil, fmt.Errorf("failed to generate block for contract deployment: %w", err)
 	}
 
-	_, waitTx, err := deployWallet.SendTransaction(ctx, signedTxn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send transaction: %w", err)
+	if len(receipts) == 0 || len(receipts[0]) == 0 {
+		return nil, fmt.Errorf("no receipts found for contract deployment")
 	}
 
-	receipt, err := waitTx(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("transaction failed: %w", err)
-	}
-
+	receipt := receipts[0][0]
 	if receipt.Status != types.ReceiptStatusSuccessful {
-		return nil, fmt.Errorf("transaction failed with status %d", receipt.Status)
+		return nil, fmt.Errorf("contract deployment failed with status: %d", receipt.Status)
 	}
 
-	return ethcontract.NewContractCaller(receipt.ContractAddress, artifact.ABI, provider), nil
+	return &ETHContractCaller{
+		Address: contractAddr,
+		ABI:     artifact.ABI,
+	}, nil
 }
 
-func (s *ETHTestServer) ContractTransact(ctx context.Context, signer *Signer, contract *ethcontract.Contract, methodName string, methodArgs ...interface{}) error {
+func (s *ETHTestServer) ContractTransact(ctx context.Context, signer *Signer, contract *ETHContractCaller, methodName string, methodArgs ...interface{}) error {
 	if signer == nil {
 		return fmt.Errorf("signer cannot be nil")
 	}
@@ -470,24 +454,34 @@ func (s *ETHTestServer) ContractTransact(ctx context.Context, signer *Signer, co
 		return fmt.Errorf("contract cannot be nil")
 	}
 
-	ethkitWallet, err := s.ETHKitWallet(signer)
+	calldata, err := contract.ABI.Pack(methodName, methodArgs...)
 	if err != nil {
-		return fmt.Errorf("failed to create ETHKit wallet: %w", err)
+		return fmt.Errorf("failed to pack contract method call: %w", err)
 	}
 
-	receipt, err := ethtest.ContractTransact(
-		ethkitWallet,
-		contract.Address,
-		contract.ABI,
-		methodName,
-		methodArgs...,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to transact with contract: %w", err)
-	}
+	_, _, err = s.GenBlocks(1, func(i int, gen *core.BlockGen) {
+		nonce := gen.TxNonce(signer.Address())
 
-	if receipt.Status != types.ReceiptStatusSuccessful {
-		return fmt.Errorf("transaction failed with status %d", receipt.Status)
+		tx := types.NewTransaction(
+			nonce,
+			common.Address(contract.Address),
+			nil, // value
+			300_000,
+			gen.BaseFee(),
+			calldata, // data
+		)
+
+		signedTxn, err := types.SignTx(tx, gen.Signer(), signer.RawPrivateKey())
+		if err != nil {
+			slog.Error("ContractTransact: Failed to sign transaction", "error", err)
+			return
+		}
+
+		gen.AddTx(signedTxn)
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to generate block for contract transaction: %w", err)
 	}
 
 	return nil
@@ -504,27 +498,6 @@ func (s *ETHTestServer) PrintStatus() {
 	)
 }
 
-func (s *ETHTestServer) ContractCall(ctx context.Context, contract *ethcontract.Contract, response interface{}, methodName string, methodArgs ...interface{}) error {
-	provider, err := s.Provider()
-	if err != nil {
-		return fmt.Errorf("failed to create provider: %w", err)
-	}
-
-	_, err = ethtest.ContractCall(
-		provider,
-		contract.Address,
-		contract.ABI,
-		response,
-		methodName,
-		methodArgs...,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to call contract method: %w", err)
-	}
-
-	return nil
-}
-
 // Mine triggers a block mining operation that will include all pending
 // transactions in the transaction pool.
 func (s *ETHTestServer) Mine() error {
@@ -532,7 +505,7 @@ func (s *ETHTestServer) Mine() error {
 }
 
 func (s *ETHTestServer) mineBlock() error {
-	return s.GenBlocks(1, func(i int, block *core.BlockGen) {
+	_, _, err := s.GenBlocks(1, func(i int, block *core.BlockGen) {
 		latestBlockHeader := s.ethereum.BlockChain().CurrentBlock()
 
 		txPool := s.ethereum.TxPool()
@@ -566,4 +539,10 @@ func (s *ETHTestServer) mineBlock() error {
 			block.AddTx(tx)
 		}
 	})
+
+	if err != nil {
+		return fmt.Errorf("failed to generate block: %w", err)
+	}
+
+	return nil
 }
