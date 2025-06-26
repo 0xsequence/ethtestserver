@@ -64,7 +64,6 @@ type ETHTestServerConfig struct {
 	AutoMining bool          // Whether to enable mining on the test server
 	MineRate   time.Duration // How often to mine a new block
 
-	MinBlockNum uint64 // Minimum block number for the test server, defaults to 1
 	MaxBlockNum uint64 // Maximum block number for the test server, defaults to unlimited
 
 	ChainID *big.Int // Chain ID for the test server
@@ -367,6 +366,10 @@ func (s *ETHTestServer) GenBlocks(n int, gen func(int, *core.BlockGen)) ([]*type
 	latestBlockHeader := bc.CurrentBlock()
 	latestBlock := bc.GetBlock(latestBlockHeader.Hash(), latestBlockHeader.Number.Uint64())
 
+	if latestBlock.Number().Uint64() >= s.config.MaxBlockNum && s.config.MaxBlockNum > 0 {
+		return nil, nil, fmt.Errorf("ETHTestServer: reached maximum block number %d", s.config.MaxBlockNum)
+	}
+
 	blocks, receipts := core.GenerateChain(
 		s.config.Genesis.Config,
 		latestBlock,
@@ -495,7 +498,6 @@ func (s *ETHTestServer) ContractTransact(ctx context.Context, signer *Signer, co
 
 		gen.AddTx(signedTxn)
 	})
-
 	if err != nil {
 		return fmt.Errorf("failed to generate block for contract transaction: %w", err)
 	}

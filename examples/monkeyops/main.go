@@ -53,8 +53,10 @@ func main() {
 	config := &ethtestserver.ETHTestServerConfig{
 		AutoMining:     true,
 		HTTPHost:       "localhost",
-		HTTPPort:       8585,
+		HTTPPort:       8545,
 		InitialSigners: knownWallets,
+		//DataDir:        "./data/geth/chaindata",
+		MaxBlockNum: 10_000,
 		InitialBalances: map[common.Address]*big.Int{
 			wallet0.Address(): initialBalance,
 			wallet1.Address(): initialBalance,

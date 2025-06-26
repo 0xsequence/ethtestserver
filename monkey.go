@@ -192,8 +192,6 @@ func (m *MonkeyOperator) do(ctx context.Context, gen *core.BlockGen) (*types.Tra
 	return m.doer.Do(ctx, m, gen)
 }
 
-var _ runnable.Runnable = (*MonkeyOperator)(nil)
-
 func PickRandomSigner(signers []*Signer) *Signer {
 	if len(signers) == 0 {
 		panic("no signers available to pick from")
@@ -214,3 +212,5 @@ func PickRandomAmount(a, b int64) *big.Int {
 	}
 	return big.NewInt(a + rand.Int63n(b-a+1))
 }
+
+var _ runnable.Runnable = (*MonkeyOperator)(nil)
