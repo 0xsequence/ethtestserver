@@ -14,8 +14,6 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 )
 
-var txSigner = types.HomesteadSigner{}
-
 // runMonkeyTransferors uses the given sender and recipient pools for ETH transfers.
 func runMonkeyTransferors(ctx context.Context, server *ethtestserver.ETHTestServer, senders []*ethtestserver.Signer, recipients []*ethtestserver.Signer) (*ethtestserver.MonkeyOperator, error) {
 	// Create a monkey doer for ETH transfers.
@@ -43,7 +41,7 @@ func runMonkeyTransferors(ctx context.Context, server *ethtestserver.ETHTestServ
 					big.NewInt(params.InitialBaseFee),
 					nil,
 				),
-				txSigner,
+				gen.Signer(),
 				sender.RawPrivateKey(),
 			)
 			if err != nil {
@@ -145,7 +143,7 @@ func runMonkeyERC1155Transferors(ctx context.Context, server *ethtestserver.ETHT
 				gen.BaseFee(),
 				calldata,
 			)
-			signedTx, err := types.SignTx(tx, txSigner, sender.RawPrivateKey())
+			signedTx, err := types.SignTx(tx, gen.Signer(), sender.RawPrivateKey())
 			if err != nil {
 				return nil, fmt.Errorf("failed to sign ERC1155 transfer transaction: %w", err)
 			}
@@ -239,7 +237,7 @@ func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTes
 				calldata,
 			)
 
-			signedTx, err := types.SignTx(tx, txSigner, sender.RawPrivateKey())
+			signedTx, err := types.SignTx(tx, gen.Signer(), sender.RawPrivateKey())
 			if err != nil {
 				return nil, fmt.Errorf("failed to sign ERC20 transfer transaction: %w", err)
 			}
@@ -330,7 +328,7 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 				calldata,
 			)
 
-			signedTx, err := types.SignTx(tx, txSigner, sender.RawPrivateKey())
+			signedTx, err := types.SignTx(tx, gen.Signer(), sender.RawPrivateKey())
 			if err != nil {
 				return nil, fmt.Errorf("failed to sign ERC721 transfer transaction: %w", err)
 			}

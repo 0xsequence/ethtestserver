@@ -38,8 +38,6 @@ import (
 	//spew "github.com/davecgh/go-spew/spew"
 )
 
-var TxSigner = types.HomesteadSigner{}
-
 type ETHContractCaller struct {
 	Address common.Address // Address of the contract
 	ABI     abi.ABI
