@@ -58,8 +58,9 @@ type ETHContractCaller struct {
 type ETHTestServer struct {
 	mu sync.Mutex
 
-	config  ETHTestServerConfig
-	stateDB *cockroachdbpebble.DB // State database for the test server
+	config    ETHTestServerConfig
+	stateDB   *cockroachdbpebble.DB // State database for the test server
+	stateDBMu sync.Mutex            // Mutex to protect stateDB access
 
 	initialized bool // Whether the server has been initialized
 
@@ -110,12 +111,11 @@ type ETHTestServerConfig struct {
 func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	s := &ETHTestServer{}
 
-	stateDB, err := cockroachdbpebble.Open(storeDataDir, &cockroachdbpebble.Options{})
+	var err error
+	s.stateDB, err = cockroachdbpebble.Open(storeDataDir, &cockroachdbpebble.Options{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create state store: %w", err)
 	}
-
-	s.stateDB = stateDB
 
 	if config == nil {
 		config = &ETHTestServerConfig{}
@@ -222,7 +222,12 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	config.NodeConfig.HTTPHost = config.HTTPHost
 	config.NodeConfig.HTTPPort = config.HTTPPort
 	config.NodeConfig.HTTPModules = []string{"eth", "net", "web3", "txpool"}
-	config.NodeConfig.Logger = log.NewLogger(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	config.NodeConfig.Logger = log.NewLogger(
+		slog.NewJSONHandler(
+			os.Stdout,
+			&slog.HandlerOptions{Level: slog.LevelDebug},
+		),
+	)
 	config.NodeConfig.DataDir = config.DataDir
 
 	stack, err := node.New(config.NodeConfig)
@@ -274,6 +279,7 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		filters.Config{},
 	)
 
+	// register the filter API
 	stack.RegisterAPIs([]rpc.API{{
 		Namespace: "eth",
 		Service: filters.NewFilterAPI(
@@ -282,11 +288,19 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	}})
 
 	// set up simulated beacon
-	simBeacon, err := catalyst.NewSimulatedBeacon(0, common.Address{}, service)
+	simBeacon, err := catalyst.NewSimulatedBeacon(
+		0,
+		common.Address{},
+		service,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create simulated beacon: %w", err)
 	}
-	if err := simBeacon.Fork(service.BlockChain().GetCanonicalHash(0)); err != nil {
+
+	// Set the initial fork for the simulated beacon
+	bc := service.BlockChain()
+	latestBlockHeader := bc.CurrentBlock()
+	if err := simBeacon.Fork(latestBlockHeader.Hash()); err != nil {
 		return nil, fmt.Errorf("failed to set beacon fork: %w", err)
 	}
 
@@ -374,6 +388,15 @@ func (s *ETHTestServer) Rollback() {
 }
 
 func (s *ETHTestServer) Stop(ctx context.Context) error {
+	s.stateDBMu.Lock()
+	if s.stateDB != nil {
+		if err := s.stateDB.Close(); err != nil {
+			slog.Error("Failed to close state database", "error", err)
+		}
+		s.stateDB = nil
+	}
+	s.stateDBMu.Unlock()
+
 	if s.node != nil {
 		err := s.node.Close()
 		if err != nil {
@@ -394,11 +417,19 @@ func (s *ETHTestServer) Stop(ctx context.Context) error {
 }
 
 func (s *ETHTestServer) RetrieveValue(key string, value interface{}) (bool, error) {
+	s.stateDBMu.Lock()
+	defer s.stateDBMu.Unlock()
+
+	if s.stateDB == nil {
+		return false, fmt.Errorf("state database is not initialized")
+	}
+
 	data, closer, err := s.stateDB.Get([]byte(key))
 	if err != nil {
 		if errors.Is(err, cockroachdbpebble.ErrNotFound) {
 			return false, nil // Key not found
 		}
+
 		return false, fmt.Errorf("failed to get state for key %s: %w", key, err)
 	}
 
@@ -437,6 +468,13 @@ func (s *ETHTestServer) StoreValue(key string, value interface{}) error {
 		return fmt.Errorf("failed to encode value for key %s: %w", key, err)
 	}
 
+	s.stateDBMu.Lock()
+	defer s.stateDBMu.Unlock()
+
+	if s.stateDB == nil {
+		return fmt.Errorf("state database is not initialized")
+	}
+
 	if err := s.stateDB.Set([]byte(key), buf.Bytes(), cockroachdbpebble.Sync); err != nil {
 		return fmt.Errorf("failed to store state for key %s: %w", key, err)
 	}
@@ -447,6 +485,13 @@ func (s *ETHTestServer) StoreValue(key string, value interface{}) error {
 func (s *ETHTestServer) DeleteValue(key string) error {
 	if len(key) == 0 {
 		return fmt.Errorf("key cannot be empty")
+	}
+
+	s.stateDBMu.Lock()
+	defer s.stateDBMu.Unlock()
+
+	if s.stateDB == nil {
+		return fmt.Errorf("state database is not initialized")
 	}
 
 	err := s.stateDB.Delete([]byte(key), cockroachdbpebble.Sync)
@@ -484,7 +529,7 @@ func (s *ETHTestServer) GenBlocks(n int, gen func(int, *core.BlockGen)) ([]*type
 		return nil, nil, fmt.Errorf("ETHTestServer: failed to insert blocks into blockchain: %w", err)
 	}
 
-	if err := s.waitForTxIndexing(); err != nil {
+	if err := s.waitForTxIndexing(context.Background()); err != nil {
 		return nil, nil, fmt.Errorf("ETHTestServer: failed to wait for transaction indexing: %w", err)
 	}
 
@@ -665,22 +710,26 @@ func (s *ETHTestServer) mineBlock() error {
 	return nil
 }
 
-func (s *ETHTestServer) waitForTxIndexing() error {
-	bc := s.ethereum.BlockChain()
+func (s *ETHTestServer) waitForTxIndexing(ctx context.Context) error {
+	timeout := time.NewTimer(30 * time.Second)
+	defer timeout.Stop()
 
-	// TODO: add max wait time
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
 	for {
-		progress, err := bc.TxIndexProgress()
-		slog.Debug("Waiting for transaction indexing", "progress", progress, "error", err)
-		if err == nil && progress.Done() {
-			break // Transaction indexing is complete
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout.C:
+			return fmt.Errorf("timeout waiting for transaction indexing")
+		case <-ticker.C:
+			progress, err := s.ethereum.BlockChain().TxIndexProgress()
+			if err == nil && progress.Done() {
+				return nil
+			}
 		}
-
-		// TODO: make this configurable
-		time.Sleep(100 * time.Millisecond) // Wait for transaction indexing to complete
 	}
-
-	return nil
 }
 
 func makeKeyValueStore(config *ETHTestServerConfig, stack *node.Node, options *node.DatabaseOptions) (ethdb.KeyValueStore, error) {
