@@ -68,6 +68,7 @@ type ETHTestServerConfig struct {
 
 	ChainID *big.Int // Chain ID for the test server
 	DataDir string   // Directory to store the blockchain data
+	DBMode  string   // Database mode for the test server (e.g., "memory", "disk")
 
 	InitialSigners   []*Signer                   // Initial signers for the test server
 	InitialBalances  map[common.Address]*big.Int // Initial account balances for the test server
@@ -143,16 +144,9 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		config.HTTPPort = 0
 	}
 
-	/*
-		if config.DataDir == "" {
-			tmpdir, err := os.MkdirTemp("", "eth-test-server-")
-			if err != nil {
-				return nil, fmt.Errorf("failed to create temporary data directory: %w", err)
-			}
-
-			config.DataDir = tmpdir
-		}
-	*/
+	if config.DataDir == "" {
+		config.DataDir = "chaindata"
+	}
 
 	if config.NodeConfig == nil {
 		config.NodeConfig = &node.Config{}
@@ -180,18 +174,10 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	config.ServiceConfig.HistoryMode = history.KeepAll
 	config.ServiceConfig.FilterLogCacheSize = 1000
 
-	var db ethdb.Database
-
 	// initialize database
-	if config.DataDir != "" {
-		pdb, err := pebble.New(config.DataDir, 128, 128, "", false, false)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create Pebble database: %w", err)
-		}
-		db = rawdb.NewDatabase(pdb)
-	} else {
-		mdb := memorydb.New()
-		db = rawdb.NewDatabase(mdb)
+	db, err := openDatabase(config, stack, false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open chain database: %w", err)
 	}
 
 	triedb := triedb.NewDatabase(db, triedb.HashDefaults)
@@ -255,6 +241,60 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	}
 
 	return s, nil
+}
+
+func makeKeyValueStore(config *ETHTestServerConfig, stack *node.Node, options *node.DatabaseOptions) (ethdb.KeyValueStore, error) {
+
+	if stack == nil {
+		return nil, fmt.Errorf("stack cannot be nil")
+	}
+
+	if options == nil {
+		options = &node.DatabaseOptions{}
+	}
+
+	if config.DBMode == "memory" || config.DataDir == "" {
+		// Use an in-memory database for testing
+		return memorydb.New(), nil
+	}
+
+	kv, err := pebble.New(
+		config.DataDir,
+		options.Cache,
+		options.Handles,
+		options.MetricsNamespace,
+		options.ReadOnly,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	return kv, nil
+}
+
+func openDatabase(config *ETHTestServerConfig, stack *node.Node, readOnly bool) (ethdb.Database, error) {
+	options := node.DatabaseOptions{
+		ReadOnly:          readOnly,
+		Cache:             32 * 1024 * 1024,
+		Handles:           128,
+		MetricsNamespace:  "eth/db/chaindata",
+		AncientsDirectory: "chaindata/ancients",
+		EraDirectory:      "chaindata/era",
+	}
+
+	kv, err := makeKeyValueStore(config, stack, &options)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create key-value store: %w", err)
+	}
+
+	opts := rawdb.OpenOptions{
+		ReadOnly:         readOnly,
+		Ancient:          options.AncientsDirectory,
+		Era:              options.EraDirectory,
+		MetricsNamespace: options.MetricsNamespace,
+	}
+
+	return rawdb.Open(kv, opts)
 }
 
 func (s *ETHTestServer) Run(ctx context.Context) error {

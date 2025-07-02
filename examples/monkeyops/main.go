@@ -55,8 +55,8 @@ func main() {
 		HTTPHost:       "localhost",
 		HTTPPort:       8545,
 		InitialSigners: knownWallets,
-		//DataDir:        "./data/geth/chaindata",
-		MaxBlockNum: 10_000,
+		DBMode:         "disk", // memory", // Use in-memory database for testing
+		MaxBlockNum:    10_000,
 		InitialBalances: map[common.Address]*big.Int{
 			wallet0.Address(): initialBalance,
 			wallet1.Address(): initialBalance,
