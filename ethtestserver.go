@@ -2,10 +2,12 @@ package ethtestserver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math/big"
 	"os"
+	"path"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +39,10 @@ import (
 	"github.com/ethereum/go-ethereum/triedb"
 )
 
+const (
+	chainDataDir = "chaindata" // Default directory for chain data
+)
+
 type ETHContractCaller struct {
 	Address common.Address // Address of the contract
 	ABI     abi.ABI
@@ -47,6 +53,8 @@ type ETHTestServer struct {
 
 	config ETHTestServerConfig
 
+	initialized bool // Whether the server has been initialized
+
 	node      *node.Node
 	ethereum  *eth.Ethereum
 	artifacts *ethartifact.ContractRegistry // Registry of JSON artifacts for the test server
@@ -55,7 +63,6 @@ type ETHTestServer struct {
 	db     ethdb.Database   // Database used by the test server
 
 	provider atomic.Value // Provider for the test server, initialized lazily
-	genesis  *types.Block // Genesis block of the test server
 
 	beacon *catalyst.SimulatedBeacon
 }
@@ -97,44 +104,89 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		config = &ETHTestServerConfig{}
 	}
 
+	initialized := false
+	if config.DBMode != "memory" && config.DataDir == "" {
+		config.DataDir = "ethereum" // Default data directory
+	}
+
+	if config.DBMode == "memory" {
+		config.DataDir = ""
+	} else {
+		dataDirStat, err := os.Stat(config.DataDir)
+		if err == nil && !dataDirStat.IsDir() {
+			return nil, fmt.Errorf("data directory %s exists but is not a directory", config.DataDir)
+		}
+
+		initialized = dataDirStat != nil && dataDirStat.IsDir()
+	}
+
 	if config.MineRate == 0 {
 		config.MineRate = 1 * time.Second // Default mine rate
 	}
 
-	if config.Genesis == nil {
-		config.Genesis = &core.Genesis{}
+	var genesisPath string
+	if config.DataDir != "" {
+		genesisPath = path.Join(config.DataDir, "genesis.json")
 	}
 
-	// override genesis config with custom values
-	if config.Genesis.Config == nil {
-		config.Genesis.Config = params.AllDevChainProtocolChanges
-	}
-
-	if config.Genesis.GasLimit == 0 {
-		config.Genesis.GasLimit = 5_000_000
-	}
-
-	if config.Genesis.BaseFee == nil {
-		config.Genesis.BaseFee = big.NewInt(params.InitialBaseFee)
-	}
-
-	if config.Genesis.Difficulty == nil {
-		config.Genesis.Difficulty = common.Big1 // Default difficulty for the genesis block
-	}
-
-	config.Genesis.Alloc = make(types.GenesisAlloc)
-	for _, signer := range config.InitialSigners {
-		addr := signer.Address()
-		balance, ok := config.InitialBalances[addr]
-		if !ok {
-			continue // Skip if no balance is set for this address
+	if initialized {
+		buf, err := os.ReadFile(genesisPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read genesis config from %s: %w", genesisPath, err)
 		}
-		config.Genesis.Alloc[addr] = types.Account{
-			Balance: balance,
+
+		if err := json.Unmarshal(buf, &config.Genesis); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal genesis config from %s: %w", genesisPath, err)
+		}
+	} else {
+		if config.Genesis == nil {
+			config.Genesis = &core.Genesis{}
+		}
+
+		// override genesis config with custom values
+		if config.Genesis.Config == nil {
+			config.Genesis.Config = params.AllDevChainProtocolChanges
+		}
+
+		if config.Genesis.GasLimit == 0 {
+			config.Genesis.GasLimit = 5_000_000
+		}
+
+		if config.Genesis.BaseFee == nil {
+			config.Genesis.BaseFee = big.NewInt(params.InitialBaseFee)
+		}
+
+		if config.Genesis.Difficulty == nil {
+			config.Genesis.Difficulty = common.Big1 // Default difficulty for the genesis block
+		}
+
+		config.Genesis.Alloc = make(types.GenesisAlloc)
+		for _, signer := range config.InitialSigners {
+			addr := signer.Address()
+			balance, ok := config.InitialBalances[addr]
+			if !ok {
+				continue // Skip if no balance is set for this address
+			}
+			config.Genesis.Alloc[addr] = types.Account{
+				Balance: balance,
+			}
+		}
+
+		config.Genesis.Timestamp = config.InitialTimestamp
+
+		// persist genesis config to disk
+		if err := os.MkdirAll(config.DataDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create data directory %s: %w", config.DataDir, err)
+		}
+
+		buf, err := json.MarshalIndent(config.Genesis, "", "  ")
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal genesis config: %w", err)
+		}
+		if err := os.WriteFile(genesisPath, buf, 0644); err != nil {
+			return nil, fmt.Errorf("failed to write genesis config to %s: %w", genesisPath, err)
 		}
 	}
-
-	config.Genesis.Timestamp = config.InitialTimestamp
 
 	if config.HTTPHost == "" {
 		config.HTTPHost = "127.0.0.1"
@@ -144,15 +196,12 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		config.HTTPPort = 0
 	}
 
-	if config.DataDir == "" {
-		config.DataDir = "chaindata"
-	}
-
 	if config.NodeConfig == nil {
 		config.NodeConfig = &node.Config{}
 	}
 
 	// override node config with custom values
+	config.NodeConfig.Name = "ethtestserver"
 	config.NodeConfig.HTTPHost = config.HTTPHost
 	config.NodeConfig.HTTPPort = config.HTTPPort
 	config.NodeConfig.HTTPModules = []string{"eth", "net", "web3", "txpool"}
@@ -174,17 +223,26 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	config.ServiceConfig.HistoryMode = history.KeepAll
 	config.ServiceConfig.FilterLogCacheSize = 1000
 
-	// initialize database
-	db, err := openDatabase(config, stack, false)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open chain database: %w", err)
+	if !initialized {
+		db, err := openDatabase(config, stack, false)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open chain database: %w", err)
+		}
+
+		triedb := triedb.NewDatabase(db, triedb.HashDefaults)
+
+		_ = config.Genesis.MustCommit(db, triedb)
+
+		if err := triedb.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close trie database: %w", err)
+		}
+
+		if err := db.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close database: %w", err)
+		}
 	}
 
-	triedb := triedb.NewDatabase(db, triedb.HashDefaults)
-	defer triedb.Close()
-
-	genesis := config.Genesis.MustCommit(db, triedb)
-
+	// initialize the main service
 	service, err := eth.New(stack, config.ServiceConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to register Ethereum service: %w", err)
@@ -223,9 +281,10 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		node:     stack,
 		ethereum: service,
 		beacon:   simBeacon,
-		genesis:  genesis,
 
-		db:     db,
+		initialized: initialized,
+
+		db:     service.ChainDb(),
 		engine: engine,
 
 		artifacts: ethartifact.NewContractRegistry(),
@@ -244,32 +303,31 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 }
 
 func makeKeyValueStore(config *ETHTestServerConfig, stack *node.Node, options *node.DatabaseOptions) (ethdb.KeyValueStore, error) {
-
 	if stack == nil {
 		return nil, fmt.Errorf("stack cannot be nil")
 	}
 
 	if options == nil {
-		options = &node.DatabaseOptions{}
+		return nil, fmt.Errorf("options cannot be nil")
 	}
 
 	if config.DBMode == "memory" || config.DataDir == "" {
-		// Use an in-memory database for testing
+		// Use an in-memory database for testing, this database is always created
 		return memorydb.New(), nil
 	}
 
-	kv, err := pebble.New(
-		config.DataDir,
+	kvdb, err := pebble.New(
+		stack.ResolvePath(chainDataDir),
 		options.Cache,
 		options.Handles,
 		options.MetricsNamespace,
 		options.ReadOnly,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
+		return nil, fmt.Errorf("failed to open pebbe database: %w", err)
 	}
 
-	return kv, nil
+	return kvdb, nil
 }
 
 func openDatabase(config *ETHTestServerConfig, stack *node.Node, readOnly bool) (ethdb.Database, error) {
@@ -278,11 +336,10 @@ func openDatabase(config *ETHTestServerConfig, stack *node.Node, readOnly bool) 
 		Cache:             32 * 1024 * 1024,
 		Handles:           128,
 		MetricsNamespace:  "eth/db/chaindata",
-		AncientsDirectory: "chaindata/ancients",
-		EraDirectory:      "chaindata/era",
+		AncientsDirectory: stack.ResolveAncient(chainDataDir, ""),
 	}
 
-	kv, err := makeKeyValueStore(config, stack, &options)
+	kvdb, err := makeKeyValueStore(config, stack, &options)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create key-value store: %w", err)
 	}
@@ -294,7 +351,12 @@ func openDatabase(config *ETHTestServerConfig, stack *node.Node, readOnly bool) 
 		MetricsNamespace: options.MetricsNamespace,
 	}
 
-	return rawdb.Open(kv, opts)
+	db, err := rawdb.Open(kvdb, opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open raw database: %w", err)
+	}
+
+	return db, nil
 }
 
 func (s *ETHTestServer) Run(ctx context.Context) error {
@@ -302,9 +364,15 @@ func (s *ETHTestServer) Run(ctx context.Context) error {
 		return fmt.Errorf("ETHTestServer: node is not initialized")
 	}
 
-	// add first empty block to initialize the blockchain
-	if _, _, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) {}); err != nil {
-		return fmt.Errorf("ETHTestServer: failed to generate initial block: %w", err)
+	if s.ethereum == nil {
+		return fmt.Errorf("ETHTestServer: ethereum service is not initialized")
+	}
+
+	if !s.initialized {
+		// add first empty block to initialize the blockchain
+		if _, _, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) {}); err != nil {
+			return fmt.Errorf("ETHTestServer: failed to generate initial block: %w", err)
+		}
 	}
 
 	// Start HTTP server
@@ -366,14 +434,6 @@ func (s *ETHTestServer) Stop(ctx context.Context) error {
 			slog.Error("Failed to stop simulated beacon", "error", err)
 		}
 		s.beacon = nil
-	}
-
-	if s.config.DataDir != "" {
-		err := os.RemoveAll(s.config.DataDir)
-		if err != nil {
-			slog.Error("Failed to remove data directory", "error", err)
-		}
-		s.config.DataDir = ""
 	}
 
 	return nil
