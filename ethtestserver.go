@@ -1,8 +1,11 @@
 package ethtestserver
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -37,10 +40,14 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/ethereum/go-ethereum/triedb"
+
+	cockroachdbpebble "github.com/cockroachdb/pebble"
 )
 
 const (
 	chainDataDir = "chaindata" // Default directory for chain data
+
+	storeDataDir = "ethtestserver.state" // Default directory for the test server data
 )
 
 type ETHContractCaller struct {
@@ -51,7 +58,8 @@ type ETHContractCaller struct {
 type ETHTestServer struct {
 	mu sync.Mutex
 
-	config ETHTestServerConfig
+	config  ETHTestServerConfig
+	stateDB *cockroachdbpebble.DB // State database for the test server
 
 	initialized bool // Whether the server has been initialized
 
@@ -100,6 +108,15 @@ type ETHTestServerConfig struct {
 
 // NewETHTestServer creates a new Ethereum test server with the given configuration.
 func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
+	s := &ETHTestServer{}
+
+	stateDB, err := cockroachdbpebble.Open(storeDataDir, &cockroachdbpebble.Options{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create state store: %w", err)
+	}
+
+	s.stateDB = stateDB
+
 	if config == nil {
 		config = &ETHTestServerConfig{}
 	}
@@ -275,20 +292,14 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 
 	engine := beacon.New(ethash.NewFaker()) // Use a fake ethash engine for testing
 
-	s := &ETHTestServer{
-		config: *config,
-
-		node:     stack,
-		ethereum: service,
-		beacon:   simBeacon,
-
-		initialized: initialized,
-
-		db:     service.ChainDb(),
-		engine: engine,
-
-		artifacts: ethartifact.NewContractRegistry(),
-	}
+	s.config = *config
+	s.node = stack
+	s.ethereum = service
+	s.beacon = simBeacon
+	s.initialized = initialized
+	s.engine = engine
+	s.db = service.ChainDb()
+	s.artifacts = ethartifact.NewContractRegistry()
 
 	// load artifacts into registry
 	if len(config.Artifacts) > 0 {
@@ -300,63 +311,6 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	}
 
 	return s, nil
-}
-
-func makeKeyValueStore(config *ETHTestServerConfig, stack *node.Node, options *node.DatabaseOptions) (ethdb.KeyValueStore, error) {
-	if stack == nil {
-		return nil, fmt.Errorf("stack cannot be nil")
-	}
-
-	if options == nil {
-		return nil, fmt.Errorf("options cannot be nil")
-	}
-
-	if config.DBMode == "memory" || config.DataDir == "" {
-		// Use an in-memory database for testing, this database is always created
-		return memorydb.New(), nil
-	}
-
-	kvdb, err := pebble.New(
-		stack.ResolvePath(chainDataDir),
-		options.Cache,
-		options.Handles,
-		options.MetricsNamespace,
-		options.ReadOnly,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open pebbe database: %w", err)
-	}
-
-	return kvdb, nil
-}
-
-func openDatabase(config *ETHTestServerConfig, stack *node.Node, readOnly bool) (ethdb.Database, error) {
-	options := node.DatabaseOptions{
-		ReadOnly:          readOnly,
-		Cache:             32 * 1024 * 1024,
-		Handles:           128,
-		MetricsNamespace:  "eth/db/chaindata",
-		AncientsDirectory: stack.ResolveAncient(chainDataDir, ""),
-	}
-
-	kvdb, err := makeKeyValueStore(config, stack, &options)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create key-value store: %w", err)
-	}
-
-	opts := rawdb.OpenOptions{
-		ReadOnly:         readOnly,
-		Ancient:          options.AncientsDirectory,
-		Era:              options.EraDirectory,
-		MetricsNamespace: options.MetricsNamespace,
-	}
-
-	db, err := rawdb.Open(kvdb, opts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open raw database: %w", err)
-	}
-
-	return db, nil
 }
 
 func (s *ETHTestServer) Run(ctx context.Context) error {
@@ -439,19 +393,65 @@ func (s *ETHTestServer) Stop(ctx context.Context) error {
 	return nil
 }
 
-func (s *ETHTestServer) waitForTxIndexing() error {
-	bc := s.ethereum.BlockChain()
-
-	// TODO: add max wait time
-	for {
-		progress, err := bc.TxIndexProgress()
-		slog.Debug("Waiting for transaction indexing", "progress", progress, "error", err)
-		if err == nil && progress.Done() {
-			break // Transaction indexing is complete
+func (s *ETHTestServer) RetrieveValue(key string, value interface{}) (bool, error) {
+	data, closer, err := s.stateDB.Get([]byte(key))
+	if err != nil {
+		if errors.Is(err, cockroachdbpebble.ErrNotFound) {
+			return false, nil // Key not found
 		}
+		return false, fmt.Errorf("failed to get state for key %s: %w", key, err)
+	}
 
-		// TODO: make this configurable
-		time.Sleep(100 * time.Millisecond) // Wait for transaction indexing to complete
+	if err := closer.Close(); err != nil {
+		return false, fmt.Errorf("failed to close state data for key %s: %w", key, err)
+	}
+
+	if len(data) == 0 {
+		return false, nil // Key not found
+	}
+
+	if value == nil {
+		// no value provided, just checking if the key exists
+		return true, nil
+	}
+
+	decoder := gob.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(value); err != nil {
+		return false, fmt.Errorf("failed to decode state data for key %s: %w", key, err)
+	}
+
+	return true, nil
+}
+
+func (s *ETHTestServer) StoreValue(key string, value interface{}) error {
+	if len(key) == 0 {
+		return fmt.Errorf("key cannot be empty")
+	}
+	if value == nil {
+		return fmt.Errorf("value cannot be nil")
+	}
+
+	var buf bytes.Buffer
+	encoder := gob.NewEncoder(&buf)
+	if err := encoder.Encode(value); err != nil {
+		return fmt.Errorf("failed to encode value for key %s: %w", key, err)
+	}
+
+	if err := s.stateDB.Set([]byte(key), buf.Bytes(), cockroachdbpebble.Sync); err != nil {
+		return fmt.Errorf("failed to store state for key %s: %w", key, err)
+	}
+
+	return nil
+}
+
+func (s *ETHTestServer) DeleteValue(key string) error {
+	if len(key) == 0 {
+		return fmt.Errorf("key cannot be empty")
+	}
+
+	err := s.stateDB.Delete([]byte(key), cockroachdbpebble.Sync)
+	if err != nil {
+		return fmt.Errorf("failed to delete state for key %s: %w", key, err)
 	}
 
 	return nil
@@ -663,4 +663,79 @@ func (s *ETHTestServer) mineBlock() error {
 	}
 
 	return nil
+}
+
+func (s *ETHTestServer) waitForTxIndexing() error {
+	bc := s.ethereum.BlockChain()
+
+	// TODO: add max wait time
+	for {
+		progress, err := bc.TxIndexProgress()
+		slog.Debug("Waiting for transaction indexing", "progress", progress, "error", err)
+		if err == nil && progress.Done() {
+			break // Transaction indexing is complete
+		}
+
+		// TODO: make this configurable
+		time.Sleep(100 * time.Millisecond) // Wait for transaction indexing to complete
+	}
+
+	return nil
+}
+
+func makeKeyValueStore(config *ETHTestServerConfig, stack *node.Node, options *node.DatabaseOptions) (ethdb.KeyValueStore, error) {
+	if stack == nil {
+		return nil, fmt.Errorf("stack cannot be nil")
+	}
+
+	if options == nil {
+		return nil, fmt.Errorf("options cannot be nil")
+	}
+
+	if config.DBMode == "memory" || config.DataDir == "" {
+		// Use an in-memory database for testing, this database is always created
+		return memorydb.New(), nil
+	}
+
+	kvdb, err := pebble.New(
+		stack.ResolvePath(chainDataDir),
+		options.Cache,
+		options.Handles,
+		options.MetricsNamespace,
+		options.ReadOnly,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open pebbe database: %w", err)
+	}
+
+	return kvdb, nil
+}
+
+func openDatabase(config *ETHTestServerConfig, stack *node.Node, readOnly bool) (ethdb.Database, error) {
+	options := node.DatabaseOptions{
+		ReadOnly:          readOnly,
+		Cache:             32 * 1024 * 1024,
+		Handles:           128,
+		MetricsNamespace:  "eth/db/chaindata",
+		AncientsDirectory: stack.ResolveAncient(chainDataDir, ""),
+	}
+
+	kvdb, err := makeKeyValueStore(config, stack, &options)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create key-value store: %w", err)
+	}
+
+	opts := rawdb.OpenOptions{
+		ReadOnly:         readOnly,
+		Ancient:          options.AncientsDirectory,
+		Era:              options.EraDirectory,
+		MetricsNamespace: options.MetricsNamespace,
+	}
+
+	db, err := rawdb.Open(kvdb, opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open raw database: %w", err)
+	}
+
+	return db, nil
 }

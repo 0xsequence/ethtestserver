@@ -73,44 +73,82 @@ func runMonkeyTransferors(ctx context.Context, server *ethtestserver.ETHTestServ
 // each sender, and sets up a monkey operator to transfer these tokens between
 // senders.
 func runMonkeyERC1155Transferors(ctx context.Context, server *ethtestserver.ETHTestServer, senders []*ethtestserver.Signer, recipients []*ethtestserver.Signer, tokenMin int64, tokenMax int64, mintAmount int64) (*ethtestserver.MonkeyOperator, error) {
-	slog.Info("Deploying ERC1155 contract for monkey transfers")
 
-	contractDeployer := ethtestserver.PickRandomSigner(senders)
+	var erc1155Contract *ethtestserver.ETHContractCaller
 
-	erc1155Contract, err := server.DeployContract(
-		ctx,
-		contractDeployer,
-		ERC1155TestTokenArtifact.ContractName,
-		contractDeployer.Address(),
-	)
+	stateKeyPrefix := "monkeyERC1155TransferorsState:"
+
+	contractDeployer := senders[0]
+
+	stateContractCallerKey := stateKeyPrefix + "contractCaller"
+
+	ok, err := server.RetrieveValue(stateContractCallerKey, &erc1155Contract)
 	if err != nil {
-		return nil, fmt.Errorf("failed to deploy ERC1155 contract: %w", err)
+		return nil, fmt.Errorf("failed to retrieve ERC1155 contract caller: %w", err)
+	}
+	if ok {
+		slog.Info("Using existing ERC1155 contract for monkey transfers", "address", erc1155Contract.Address.Hex())
+	} else {
+		slog.Info("Deploying ERC1155 contract for monkey transfers")
+		// deploy the ERC1155 contract if not already deployed
+		var err error
+		erc1155Contract, err = server.DeployContract(
+			ctx,
+			contractDeployer,
+			ERC1155TestTokenArtifact.ContractName,
+			contractDeployer.Address(),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to deploy ERC1155 contract: %w", err)
+		}
+		// store the contract caller for future use
+		if err := server.StoreValue(stateContractCallerKey, erc1155Contract); err != nil {
+			return nil, fmt.Errorf("failed to store ERC1155 contract caller: %w", err)
+		}
+		slog.Info("Deployed ERC1155 contract", "address", erc1155Contract.Address.Hex())
 	}
 
-	// Mint tokens for each sender
-	for i := tokenMin; i <= tokenMax; i++ {
-		tokenID := big.NewInt(i)
-		for _, s := range senders {
-			slog.Info("Minting ERC1155 tokens", "address", s.Address())
-			err = server.ContractTransact(
-				ctx,
-				contractDeployer,
-				erc1155Contract,
-				"mint",
-				s.Address(),
-				tokenID,
-				big.NewInt(mintAmount),
-				[]byte{},
-			)
-			if err != nil {
-				return nil, fmt.Errorf("failed to mint ERC1155 tokens for %s: %w", s.Address().Hex(), err)
+	stateTokensMintedKey := stateKeyPrefix + "tokensMinted"
+	ok, err = server.RetrieveValue(stateTokensMintedKey, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve tokens minted state: %w", err)
+	}
+
+	if ok {
+		slog.Info("Tokens already minted for monkey transfers, skipping minting")
+	} else {
+		slog.Info("Minting ERC1155 tokens for monkey transfers")
+
+		// Mint tokens for each sender
+		for i := tokenMin; i <= tokenMax; i++ {
+			tokenID := big.NewInt(i)
+			for _, s := range senders {
+				slog.Info("Minting ERC1155 tokens", "address", s.Address())
+				err = server.ContractTransact(
+					ctx,
+					contractDeployer,
+					erc1155Contract,
+					"mint",
+					s.Address(),
+					tokenID,
+					big.NewInt(mintAmount),
+					[]byte{},
+				)
+				if err != nil {
+					return nil, fmt.Errorf("failed to mint ERC1155 tokens for %s: %w", s.Address().Hex(), err)
+				}
+				slog.Info("Minted ERC1155 tokens",
+					"contract", erc1155Contract.Address.Hex(),
+					"recipient", s.Address().Hex(),
+					"tokenID", tokenID.String(),
+					"amount", mintAmount,
+				)
 			}
-			slog.Info("Minted ERC1155 tokens",
-				"contract", erc1155Contract.Address.Hex(),
-				"recipient", s.Address().Hex(),
-				"tokenID", tokenID.String(),
-				"amount", mintAmount,
-			)
+		}
+
+		// Store the state that tokens have been minted
+		if err := server.StoreValue(stateTokensMintedKey, true); err != nil {
+			return nil, fmt.Errorf("failed to store tokens minted state: %w", err)
 		}
 	}
 
