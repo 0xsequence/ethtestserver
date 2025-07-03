@@ -1,48 +1,52 @@
-package ethtestserver
+package monkey
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"math/rand"
 	"sync/atomic"
 	"time"
 
+	"github.com/0xsequence/ethtestserver"
 	"github.com/0xsequence/runnable"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-type MonkeyNOPDoer struct{}
+var (
+	defaultMonkeyOperatorTickerInterval       = 100 * time.Millisecond // Default interval for executing operations
+	defaultMonkeyOperatorTransactionsPerBlock = 20                     // Default transactions per block
+)
 
-func (m *MonkeyNOPDoer) Do(ctx context.Context, op *MonkeyOperator, gen *core.BlockGen) (*types.Transaction, error) {
-	// No operation, just a placeholder
-	slog.Info("MonkeyNOPDoer: doing nothing")
-	return nil, nil
+type MonkeyOperatorConfig struct {
+	Signers              []*ethtestserver.Signer // List of signers to use for operations
+	Ticks                int                     // Number of ticks to run, 0 means infinite
+	TickerInterval       time.Duration           // Interval for the ticker, default is 100ms
+	TransactionsPerBlock int                     // Number of transactions to add per block, default is 100
 }
 
 type MonkeyOperator struct {
 	config *MonkeyOperatorConfig // Configuration for the operator
 
-	signers []*Signer
+	signers []*ethtestserver.Signer
 	done    chan struct{}
 
 	running atomic.Bool // Flag to indicate if the operator is running
 
 	doer MonkeyDoer
 
-	blockAdder MonkeyBlockAdder
+	blockGenerator MonkeyBlockGenerator
 }
 
-func (m *MonkeyOperator) PickSigners(n int) ([]*Signer, error) {
+func (m *MonkeyOperator) PickSigners(n int) ([]*ethtestserver.Signer, error) {
 	// pick n non-duplicate signers from the list
 	if n <= 0 || n > len(m.signers) {
 		return nil, fmt.Errorf("invalid number of signers requested: %d, available: %d", n, len(m.signers))
 	}
 
 	pickedIndices := make(map[int]struct{})
-	pickedSigners := make([]*Signer, 0, n)
+	pickedSigners := make([]*ethtestserver.Signer, 0, n)
 	for len(pickedSigners) < n {
 		index := rand.Intn(len(m.signers))
 		if _, exists := pickedIndices[index]; !exists {
@@ -54,41 +58,9 @@ func (m *MonkeyOperator) PickSigners(n int) ([]*Signer, error) {
 	return pickedSigners, nil
 }
 
-type MonkeyDoer interface {
-	Do(ctx context.Context, op *MonkeyOperator, gen *core.BlockGen) (*types.Transaction, error)
-}
-
-type MonkeyBlockAdder interface {
-	GenBlocks(int, func(int, *core.BlockGen) error) ([]*types.Block, []types.Receipts, error)
-}
-
-var (
-	defaultMonkeyOperatorTickerInterval       = 100 * time.Millisecond // Default interval for executing operations
-	defaultMonkeyOperatorTransactionsPerBlock = 20                     // Default transactions per block
-)
-
-type MonkeyOperatorConfig struct {
-	Signers              []*Signer     // List of signers to use for operations
-	Ticks                int           // Number of ticks to run, 0 means infinite
-	TickerInterval       time.Duration // Interval for the ticker, default is 100ms
-	TransactionsPerBlock int           // Number of transactions to add per block, default is 100
-}
-
-type MonkeyDoerFunc struct {
-	doer func(ctx context.Context, op *MonkeyOperator, gen *core.BlockGen) (*types.Transaction, error)
-}
-
-func (f *MonkeyDoerFunc) Do(ctx context.Context, op *MonkeyOperator, gen *core.BlockGen) (*types.Transaction, error) {
-	return f.doer(ctx, op, gen)
-}
-
-func NewMonkeyDoer(doer func(ctx context.Context, op *MonkeyOperator, gen *core.BlockGen) (*types.Transaction, error)) MonkeyDoer {
-	return &MonkeyDoerFunc{doer: doer}
-}
-
-func NewMonkeyOperator(config *MonkeyOperatorConfig, monkeyDoer MonkeyDoer, blockAdder MonkeyBlockAdder) (*MonkeyOperator, error) {
-	if blockAdder == nil {
-		return nil, fmt.Errorf("blockAdder cannot be nil")
+func NewMonkeyOperator(config *MonkeyOperatorConfig, monkeyDoer MonkeyDoer, blockGenerator MonkeyBlockGenerator) (*MonkeyOperator, error) {
+	if blockGenerator == nil {
+		return nil, fmt.Errorf("blockGenerator cannot be nil")
 	}
 	if config == nil {
 		config = &MonkeyOperatorConfig{}
@@ -103,15 +75,15 @@ func NewMonkeyOperator(config *MonkeyOperatorConfig, monkeyDoer MonkeyDoer, bloc
 	}
 
 	// copy signers to avoid modifying the original slice
-	signers := make([]*Signer, len(config.Signers))
+	signers := make([]*ethtestserver.Signer, len(config.Signers))
 	copy(signers, config.Signers)
 
 	return &MonkeyOperator{
-		config:     config,
-		signers:    signers,
-		blockAdder: blockAdder,
-		doer:       monkeyDoer,
-		done:       make(chan struct{}),
+		config:         config,
+		signers:        signers,
+		blockGenerator: blockGenerator,
+		doer:           monkeyDoer,
+		done:           make(chan struct{}),
 	}, nil
 }
 
@@ -135,7 +107,7 @@ func (m *MonkeyOperator) Run(ctx context.Context) error {
 			case <-m.done:
 				return
 			case <-ticker.C:
-				_, _, err := m.blockAdder.GenBlocks(1, func(i int, gen *core.BlockGen) error {
+				_, _, err := m.blockGenerator.GenerateBlocks(1, func(i int, gen *core.BlockGen) error {
 					for j := 0; j < m.config.TransactionsPerBlock; j++ {
 						tx, err := m.do(ctx, gen)
 						if err != nil {
@@ -191,27 +163,6 @@ func (m *MonkeyOperator) do(ctx context.Context, gen *core.BlockGen) (*types.Tra
 		return nil, fmt.Errorf("MonkeyOperator: doer is not set")
 	}
 	return m.doer.Do(ctx, m, gen)
-}
-
-func PickRandomSigner(signers []*Signer) *Signer {
-	if len(signers) == 0 {
-		panic("no signers available to pick from")
-	}
-	index := rand.Intn(len(signers))
-	return signers[index]
-}
-
-func PickRandomAmount(a, b int64) *big.Int {
-	if a > b {
-		a, b = b, a
-	}
-	if a < 0 || b < 0 {
-		panic("amounts must be non-negative")
-	}
-	if a == b {
-		return big.NewInt(a)
-	}
-	return big.NewInt(a + rand.Int63n(b-a+1))
 }
 
 var _ runnable.Runnable = (*MonkeyOperator)(nil)
