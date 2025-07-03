@@ -455,23 +455,27 @@ func (s *ETHTestServer) MiningStats() map[string]interface{} {
 	return status
 }
 
-// simulateFork is used to simulate a reorg/fork by removing the last N blocks.
-func (s *ETHTestServer) simulateFork(blocksBehind int) error {
-	// TODO: implement a simulated fork by removing the last N blocks.
-	slog.Info("Simulating fork", "blocksBehind", blocksBehind)
-	return nil
-}
+func (s *ETHTestServer) simulateFork(blockNumber int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-func (s *ETHTestServer) Commit() common.Hash {
-	return s.beacon.Commit()
-}
+	if blockNumber < 0 {
+		return fmt.Errorf("blockNumber must be non-negative, got %d", blockNumber)
+	}
 
-func (s *ETHTestServer) Fork(parentHash common.Hash) error {
-	return s.beacon.Fork(parentHash)
-}
+	bc := s.ethereum.BlockChain()
 
-func (s *ETHTestServer) Rollback() {
+	blockHash := bc.GetCanonicalHash(uint64(blockNumber))
+
+	if err := s.beacon.Fork(blockHash); err != nil {
+		return fmt.Errorf("failed to fork simulated beacon: %w", err)
+	}
+
 	s.beacon.Rollback()
+
+	s.beacon.Commit()
+
+	return nil
 }
 
 func (s *ETHTestServer) Stop(ctx context.Context) error {
@@ -862,7 +866,7 @@ func (s *ETHTestServer) mineBlock() error {
 			}
 
 			if depth > 0 {
-				if err := s.simulateFork(depth); err != nil {
+				if err := s.simulateFork(currentHeight - depth); err != nil {
 					return fmt.Errorf("failed to simulate fork: %w", err)
 				}
 			} else {
