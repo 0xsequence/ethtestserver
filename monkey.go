@@ -59,7 +59,7 @@ type MonkeyDoer interface {
 }
 
 type MonkeyBlockAdder interface {
-	GenBlocks(int, func(int, *core.BlockGen)) ([]*types.Block, []types.Receipts, error)
+	GenBlocks(int, func(int, *core.BlockGen) error) ([]*types.Block, []types.Receipts, error)
 }
 
 var (
@@ -135,21 +135,19 @@ func (m *MonkeyOperator) Run(ctx context.Context) error {
 			case <-m.done:
 				return
 			case <-ticker.C:
-				_, _, err := m.blockAdder.GenBlocks(1, func(i int, gen *core.BlockGen) {
+				_, _, err := m.blockAdder.GenBlocks(1, func(i int, gen *core.BlockGen) error {
 					for j := 0; j < m.config.TransactionsPerBlock; j++ {
 						tx, err := m.do(ctx, gen)
 						if err != nil {
-							slog.Error("MonkeyOperator: failed to do operation", "error", err)
-							return
+							return fmt.Errorf("failed to generate transaction: %w", err)
 						}
 
 						if tx != nil {
 							gen.AddTx(tx)
-							slog.Debug("MonkeyOperator: added transaction to block", "txHash", tx.Hash().Hex())
-						} else {
-							slog.Debug("MonkeyOperator: no transaction generated")
 						}
 					}
+
+					return nil
 				})
 
 				if err != nil {

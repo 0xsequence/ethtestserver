@@ -5,7 +5,6 @@ import (
 	"log"
 	"log/slog"
 	"math/big"
-	"os"
 	"time"
 
 	"github.com/0xsequence/ethkit/ethartifact"
@@ -115,51 +114,53 @@ func main() {
 		monkeyTransferor.Stop(ctx)
 	}()
 
-	// run monkey transferors for ERC1155
-	go func() {
-		monkeyERC1155Transferor, err := runMonkeyERC1155Transferors(ctx, server, knownWallets, knownWallets, 1, 256, 1000)
-		if err != nil {
-			slog.Error("Failed to run monkey ERC1155 transferors", "error", err)
-			return
-		}
+	/*
+		// run monkey transferors for ERC1155
+		go func() {
+			monkeyERC1155Transferor, err := runMonkeyERC1155Transferors(ctx, server, knownWallets, knownWallets, 1, 256, 1000)
+			if err != nil {
+				slog.Error("Failed to run monkey ERC1155 transferors", "error", err)
+				return
+			}
+
+			<-ctx.Done()
+			monkeyERC1155Transferor.Stop(ctx)
+		}()
+
+		// run monkey transferors for ERC20
+		go func() {
+			monkeyERC20Transferor, err := runMonkeyERC20Transferors(ctx, server, knownWallets, knownWallets, 10_000)
+			if err != nil {
+				slog.Error("Failed to run monkey ERC20 transferors", "error", err)
+				return
+			}
+
+			<-ctx.Done()
+			monkeyERC20Transferor.Stop(ctx)
+		}()
+
+		// run monkey transferors for ERC721
+		go func() {
+			monkeyERC721Transferor, err := runMonkeyERC721Transferors(ctx, server, knownWallets, knownWallets, 256)
+			if err != nil {
+				slog.Error("Failed to run monkey ERC721 transferors", "error", err)
+				return
+			}
+
+			<-ctx.Done()
+			monkeyERC721Transferor.Stop(ctx)
+		}()
 
 		<-ctx.Done()
-		monkeyERC1155Transferor.Stop(ctx)
-	}()
+		slog.Info("Test run completed, stopping server")
 
-	// run monkey transferors for ERC20
-	go func() {
-		monkeyERC20Transferor, err := runMonkeyERC20Transferors(ctx, server, knownWallets, knownWallets, 10_000)
+		err = server.Stop(ctx)
 		if err != nil {
-			slog.Error("Failed to run monkey ERC20 transferors", "error", err)
+			slog.Error("Failed to stop test server", "error", err)
+			os.Exit(1)
 			return
 		}
-
-		<-ctx.Done()
-		monkeyERC20Transferor.Stop(ctx)
-	}()
-
-	// run monkey transferors for ERC721
-	go func() {
-		monkeyERC721Transferor, err := runMonkeyERC721Transferors(ctx, server, knownWallets, knownWallets, 256)
-		if err != nil {
-			slog.Error("Failed to run monkey ERC721 transferors", "error", err)
-			return
-		}
-
-		<-ctx.Done()
-		monkeyERC721Transferor.Stop(ctx)
-	}()
-
-	<-ctx.Done()
-	slog.Info("Test run completed, stopping server")
-
-	err = server.Stop(ctx)
-	if err != nil {
-		slog.Error("Failed to stop test server", "error", err)
-		os.Exit(1)
-		return
-	}
+	*/
 }
 
 func printStatus(ctx context.Context, server *ethtestserver.ETHTestServer) {
