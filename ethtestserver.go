@@ -87,6 +87,15 @@ type ETHTestServer struct {
 	beacon *catalyst.SimulatedBeacon
 }
 
+type ETHTestServerStats struct {
+	BlocksMined      uint64        // Total number of blocks mined
+	TxCount          uint64        // Total number of transactions processed
+	CurrentBlock     uint64        // Current block number
+	CurrentBlockHash common.Hash   // Hash of the current block
+	MiningRate       time.Duration // Rate at which blocks are mined
+	ElapsedTime      time.Duration // Total elapsed time since mining started
+}
+
 // ETHTestServerConfig represents the configuration for ETHTestServer.
 type ETHTestServerConfig struct {
 	AutoMining bool          // Whether to enable mining on the test server
@@ -428,11 +437,13 @@ func (s *ETHTestServer) Run(ctx context.Context) error {
 				return
 			case <-ticker.C:
 				err := s.mineBlock()
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					slog.Info("Stopping mining due to context error", "error", err)
-					return
+				if err != nil {
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						slog.Info("Stopping mining due to context error", "error", err)
+						return
+					}
+					slog.Warn("Failed to mine a block, will retry", "error", err)
 				}
-				slog.Warn("Failed to mine a block, will retry", "error", err)
 			}
 		}
 	}()
@@ -487,6 +498,13 @@ func (s *ETHTestServer) simulateFork(blockNumber int) error {
 
 	bc := s.ethereum.BlockChain()
 
+	beforeFork := bc.CurrentBlock()
+	slog.Info(
+		"Simulating fork",
+		"currentBlockNumber", beforeFork.Number.Uint64(),
+		"currentBlockHash", beforeFork.Hash().Hex(),
+	)
+
 	blockHash := bc.GetCanonicalHash(uint64(blockNumber))
 
 	if err := s.beacon.Fork(blockHash); err != nil {
@@ -496,6 +514,14 @@ func (s *ETHTestServer) simulateFork(blockNumber int) error {
 	s.beacon.Rollback()
 
 	s.beacon.Commit()
+
+	afterFork := bc.CurrentBlock()
+	slog.Info(
+		"Fork simulated successfully",
+		"newBlockNumber",
+		afterFork.Number.Uint64(),
+		"newBlockHash", afterFork.Hash().Hex(),
+	)
 
 	return nil
 }

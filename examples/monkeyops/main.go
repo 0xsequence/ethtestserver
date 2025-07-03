@@ -5,6 +5,7 @@ import (
 	"log"
 	"log/slog"
 	"math/big"
+	"os"
 	"time"
 
 	"github.com/0xsequence/ethkit/ethartifact"
@@ -50,12 +51,16 @@ func main() {
 	}
 
 	config := &ethtestserver.ETHTestServerConfig{
-		AutoMining:     true,
-		HTTPHost:       "localhost",
-		HTTPPort:       8545,
-		InitialSigners: knownWallets,
-		DBMode:         "disk", // memory", // Use in-memory database for testing
-		MaxBlockNum:    10_000,
+		AutoMining:       true,
+		HTTPHost:         "localhost",
+		HTTPPort:         8545,
+		InitialSigners:   knownWallets,
+		ReorgProbability: 0.1, // 10% chance of reorgs
+
+		ReorgDepthMin: 3, // minimum depth for reorgs
+		ReorgDepthMax: 6, // maximum depth for reorgs
+
+		DBMode: "disk", // memory", // Use in-memory database for testing
 		InitialBalances: map[common.Address]*big.Int{
 			wallet0.Address(): initialBalance,
 			wallet1.Address(): initialBalance,
@@ -150,17 +155,17 @@ func main() {
 			<-ctx.Done()
 			monkeyERC721Transferor.Stop(ctx)
 		}()
-
-		<-ctx.Done()
-		slog.Info("Test run completed, stopping server")
-
-		err = server.Stop(ctx)
-		if err != nil {
-			slog.Error("Failed to stop test server", "error", err)
-			os.Exit(1)
-			return
-		}
 	*/
+
+	<-ctx.Done()
+	slog.Info("Test run completed, stopping server")
+
+	err = server.Stop(ctx)
+	if err != nil {
+		slog.Error("Failed to stop test server", "error", err)
+		os.Exit(1)
+		return
+	}
 }
 
 func printStatus(ctx context.Context, server *ethtestserver.ETHTestServer) {

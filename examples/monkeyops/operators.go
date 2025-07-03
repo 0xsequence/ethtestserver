@@ -24,7 +24,7 @@ func runMonkeyTransferors(ctx context.Context, server *ethtestserver.ETHTestServ
 
 			nonce := gen.TxNonce(sender.Address())
 
-			slog.Info("ETH transfer",
+			slog.Debug("ETH transfer",
 				"sender", sender.Address().Hex(),
 				"recipient", recipient.Address().Hex(),
 				"amount", amount.String(),
@@ -81,9 +81,9 @@ func runMonkeyERC1155Transferors(ctx context.Context, server *ethtestserver.ETHT
 		return nil, fmt.Errorf("failed to retrieve ERC1155 contract caller: %w", err)
 	}
 	if ok {
-		slog.Info("Using existing ERC1155 contract for monkey transfers", "address", erc1155Contract.Address.Hex())
+		slog.Debug("Using existing ERC1155 contract for monkey transfers", "address", erc1155Contract.Address.Hex())
 	} else {
-		slog.Info("Deploying ERC1155 contract for monkey transfers")
+		slog.Debug("Deploying ERC1155 contract for monkey transfers")
 		contractDeployer := senders[0]
 		erc1155Contract, err = server.DeployContract(
 			contractDeployer,
@@ -96,7 +96,7 @@ func runMonkeyERC1155Transferors(ctx context.Context, server *ethtestserver.ETHT
 		if err := server.StoreValue(stateContractCallerKey, erc1155Contract); err != nil {
 			return nil, fmt.Errorf("failed to store ERC1155 contract caller: %w", err)
 		}
-		slog.Info("Deployed ERC1155 contract", "address", erc1155Contract.Address.Hex())
+		slog.Debug("Deployed ERC1155 contract", "address", erc1155Contract.Address.Hex())
 	}
 
 	stateTokensMintedKey := stateKeyPrefix + "tokensMinted"
@@ -106,13 +106,13 @@ func runMonkeyERC1155Transferors(ctx context.Context, server *ethtestserver.ETHT
 	}
 
 	if ok {
-		slog.Info("Tokens already minted for monkey transfers, skipping minting")
+		slog.Debug("Tokens already minted for monkey transfers, skipping minting")
 	} else {
-		slog.Info("Minting ERC1155 tokens for monkey transfers")
+		slog.Debug("Minting ERC1155 tokens for monkey transfers")
 		for i := tokenMin; i <= tokenMax; i++ {
 			tokenID := big.NewInt(i)
 			for _, s := range senders {
-				slog.Info("Minting ERC1155 tokens", "recipient", s.Address().Hex())
+				slog.Debug("Minting ERC1155 tokens", "recipient", s.Address().Hex())
 				err = server.ContractTransact(
 					senders[0],
 					erc1155Contract,
@@ -125,7 +125,7 @@ func runMonkeyERC1155Transferors(ctx context.Context, server *ethtestserver.ETHT
 				if err != nil {
 					return nil, fmt.Errorf("failed to mint ERC1155 tokens for %s: %w", s.Address().Hex(), err)
 				}
-				slog.Info("Minted ERC1155 tokens",
+				slog.Debug("Minted ERC1155 tokens",
 					"contract", erc1155Contract.Address.Hex(),
 					"recipient", s.Address().Hex(),
 					"tokenID", tokenID.String(),
@@ -187,11 +187,11 @@ func runMonkeyERC1155Transferors(ctx context.Context, server *ethtestserver.ETHT
 		return nil, fmt.Errorf("failed to create monkey ERC1155 transfer operator: %w", err)
 	}
 
-	slog.Info("Created Monkey ERC1155 Transfer operator", "signersCount", len(senders))
+	slog.Debug("Created Monkey ERC1155 Transfer operator", "signersCount", len(senders))
 	if err = monkeyTransferOperator.Run(ctx); err != nil {
 		return nil, fmt.Errorf("failed to run monkey ERC1155 transfer operator: %w", err)
 	}
-	slog.Info("Monkey ERC1155 Transfer operator started")
+	slog.Debug("Monkey ERC1155 Transfer operator started")
 
 	return monkeyTransferOperator, nil
 }
@@ -209,9 +209,9 @@ func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTes
 		return nil, fmt.Errorf("failed to retrieve ERC20 contract caller: %w", err)
 	}
 	if ok {
-		slog.Info("Using existing ERC20 contract for monkey transfers", "address", erc20Contract.Address.Hex())
+		slog.Debug("Using existing ERC20 contract for monkey transfers", "address", erc20Contract.Address.Hex())
 	} else {
-		slog.Info("Deploying ERC20 contract for monkey transfers")
+		slog.Debug("Deploying ERC20 contract for monkey transfers")
 		contractDeployer := senders[0]
 		// For ERC20 the recipient/initial owner information might be the same.
 		contractRecipient := senders[0]
@@ -228,7 +228,7 @@ func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTes
 		if err := server.StoreValue(stateContractCallerKey, erc20Contract); err != nil {
 			return nil, fmt.Errorf("failed to store ERC20 contract caller: %w", err)
 		}
-		slog.Info("Deployed ERC20 contract", "address", erc20Contract.Address.Hex())
+		slog.Debug("Deployed ERC20 contract", "address", erc20Contract.Address.Hex())
 	}
 
 	// Check if tokens have been minted already.
@@ -239,9 +239,9 @@ func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTes
 		return nil, fmt.Errorf("failed to retrieve tokens minted state for ERC20: %w", err)
 	}
 	if ok && tokensMinted {
-		slog.Info("Tokens already minted for ERC20 monkey transfers, skipping minting")
+		slog.Debug("Tokens already minted for ERC20 monkey transfers, skipping minting")
 	} else {
-		slog.Info("Minting ERC20 tokens for monkey transfers")
+		slog.Debug("Minting ERC20 tokens for monkey transfers")
 		// Mint tokens for each sender.
 		for _, s := range senders {
 			err = server.ContractTransact(
@@ -308,12 +308,12 @@ func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTes
 		return nil, fmt.Errorf("failed to create monkey ERC20 transfer operator: %w", err)
 	}
 
-	slog.Info("Created Monkey ERC20 Transfer operator", "signersCount", len(senders))
+	slog.Debug("Created Monkey ERC20 Transfer operator", "signersCount", len(senders))
 	if err = monkeyTransferOperator.Run(ctx); err != nil {
 		return nil, fmt.Errorf("failed to run monkey ERC20 transfer operator: %w", err)
 	}
 
-	slog.Info("Monkey ERC20 Transfer operator started")
+	slog.Debug("Monkey ERC20 Transfer operator started")
 	return monkeyTransferOperator, nil
 }
 
@@ -330,9 +330,9 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 		return nil, fmt.Errorf("failed to retrieve ERC721 contract caller: %w", err)
 	}
 	if ok {
-		slog.Info("Using existing ERC721 contract for monkey transfers", "address", erc721Contract.Address.Hex())
+		slog.Debug("Using existing ERC721 contract for monkey transfers", "address", erc721Contract.Address.Hex())
 	} else {
-		slog.Info("Deploying ERC721 contract for monkey transfers")
+		slog.Debug("Deploying ERC721 contract for monkey transfers")
 		contractDeployer := ethtestserver.PickRandomSigner(senders)
 		erc721Contract, err = server.DeployContract(
 			contractDeployer,
@@ -345,7 +345,7 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 		if err := server.StoreValue(stateContractCallerKey, erc721Contract); err != nil {
 			return nil, fmt.Errorf("failed to store ERC721 contract caller: %w", err)
 		}
-		slog.Info("Deployed ERC721 contract", "address", erc721Contract.Address.Hex())
+		slog.Debug("Deployed ERC721 contract", "address", erc721Contract.Address.Hex())
 	}
 
 	// Retrieve the token mapping state if available.
@@ -358,9 +358,9 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 	}
 
 	if ok {
-		slog.Info("Tokens already minted for ERC721 monkey transfers, using stored token mapping")
+		slog.Debug("Tokens already minted for ERC721 monkey transfers, using stored token mapping")
 	} else {
-		slog.Info("Minting ERC721 tokens for monkey transfers")
+		slog.Debug("Minting ERC721 tokens for monkey transfers")
 		tokenMapping = make(map[common.Address][]uint64)
 		var nextTokenID uint64 = 1
 
@@ -377,7 +377,7 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 					return nil, fmt.Errorf("failed to mint ERC721 token for %s: %w", s.Address().Hex(), err)
 				}
 
-				slog.Info("Minted ERC721 token",
+				slog.Debug("Minted ERC721 token",
 					"contract", erc721Contract.Address.Hex(),
 					"recipient", s.Address().Hex(),
 					"tokenID", nextTokenID,
@@ -437,7 +437,7 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 				return nil, fmt.Errorf("failed to sign ERC721 transfer transaction: %w", err)
 			}
 
-			slog.Info("ERC721 transfer",
+			slog.Debug("ERC721 transfer",
 				"sender", sender.Address().Hex(),
 				"recipient", recipient.Address().Hex(),
 				"tokenID", tokenID,
@@ -464,11 +464,11 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 		return nil, fmt.Errorf("failed to create monkey ERC721 transfer operator: %w", err)
 	}
 
-	slog.Info("Created Monkey ERC721 Transfer operator", "signersCount", len(senders))
+	slog.Debug("Created Monkey ERC721 Transfer operator", "signersCount", len(senders))
 	if err = monkeyTransferOperator.Run(ctx); err != nil {
 		return nil, fmt.Errorf("failed to run monkey ERC721 transfer operator: %w", err)
 	}
 
-	slog.Info("Monkey ERC721 Transfer operator started")
+	slog.Debug("Monkey ERC721 Transfer operator started")
 	return monkeyTransferOperator, nil
 }
