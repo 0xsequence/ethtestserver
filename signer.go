@@ -81,10 +81,12 @@ func GenSigners(n int) []*Signer {
 	if n < 0 {
 		return nil
 	}
+
 	// Create a slice with capacity n (could be empty if n==0)
 	signers := make([]*Signer, n)
 	for i := 0; i < n; i++ {
 		signers[i] = NewSigner()
 	}
+
 	return signers
 }
