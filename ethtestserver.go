@@ -339,7 +339,7 @@ func (s *ETHTestServer) Run(ctx context.Context) error {
 
 	if !s.initialized {
 		// add first empty block to initialize the blockchain
-		if _, _, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) {}); err != nil {
+		if _, _, err := s.GenBlocks(1, nil); err != nil {
 			return fmt.Errorf("ETHTestServer: failed to generate initial block: %w", err)
 		}
 	}
@@ -388,10 +388,11 @@ func (s *ETHTestServer) Run(ctx context.Context) error {
 				return
 			case <-ticker.C:
 				err := s.mineBlock()
-				if err != nil {
-					slog.Error("Failed to mine block, stopping mining", "error", err)
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					slog.Info("Stopping mining due to context error", "error", err)
 					return
 				}
+				slog.Warn("Failed to mine a block, will retry", "error", err)
 			}
 		}
 	}()
@@ -562,9 +563,13 @@ func (s *ETHTestServer) DeleteValue(key string) error {
 	return nil
 }
 
-func (s *ETHTestServer) GenBlocks(n int, gen func(int, *core.BlockGen)) ([]*types.Block, []types.Receipts, error) {
+func (s *ETHTestServer) GenBlocks(n int, blockGenFn func(int, *core.BlockGen) error) ([]*types.Block, []types.Receipts, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if n <= 0 {
+		return nil, nil, fmt.Errorf("ETHTestServer: number of blocks to generate must be greater than 0")
+	}
 
 	bc := s.ethereum.BlockChain()
 
@@ -584,14 +589,33 @@ func (s *ETHTestServer) GenBlocks(n int, gen func(int, *core.BlockGen)) ([]*type
 		}
 	}
 
+	var genErr error
+
 	blocks, receipts := core.GenerateChain(
 		s.config.Genesis.Config,
 		latestBlock,
 		s.engine,
 		s.db,
 		n,
-		gen,
+		func(i int, gen *core.BlockGen) {
+			if blockGenFn == nil {
+				return // No block generation function provided, this is an empty block
+			}
+
+			if genErr != nil {
+				return // Stop further block generation if an error has occurred
+			}
+
+			if err := blockGenFn(i, gen); err != nil {
+				genErr = fmt.Errorf("block generation failed: %w", err)
+				return
+			}
+		},
 	)
+
+	if genErr != nil {
+		return nil, nil, fmt.Errorf("ETHTestServer: block generation error: %w", genErr)
+	}
 
 	_, err := bc.InsertChain(blocks)
 	if err != nil {
@@ -635,7 +659,7 @@ func (s *ETHTestServer) DeployContract(signer *Signer, contractName string, cons
 
 	calldata = append(calldata, input...)
 
-	_, receipts, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) {
+	_, receipts, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) error {
 		nonce := gen.TxNonce(signer.Address())
 
 		tx := types.NewContractCreation(
@@ -648,11 +672,11 @@ func (s *ETHTestServer) DeployContract(signer *Signer, contractName string, cons
 
 		signedTxn, err := types.SignTx(tx, gen.Signer(), signer.RawPrivateKey())
 		if err != nil {
-			slog.Error("DeployContract: Failed to sign transaction", "error", err)
-			return
+			return fmt.Errorf("failed to sign transaction: %w", err)
 		}
 
 		gen.AddTx(signedTxn)
+		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate block for contract deployment: %w", err)
@@ -692,7 +716,7 @@ func (s *ETHTestServer) ContractTransact(signer *Signer, contract *ETHContractCa
 		return fmt.Errorf("failed to pack contract method call: %w", err)
 	}
 
-	_, receipts, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) {
+	_, receipts, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) error {
 		nonce := gen.TxNonce(signer.Address())
 
 		tx := types.NewTransaction(
@@ -706,11 +730,11 @@ func (s *ETHTestServer) ContractTransact(signer *Signer, contract *ETHContractCa
 
 		signedTxn, err := types.SignTx(tx, gen.Signer(), signer.RawPrivateKey())
 		if err != nil {
-			slog.Error("ContractTransact: Failed to sign transaction", "error", err)
-			return
+			return fmt.Errorf("failed to sign transaction: %w", err)
 		}
 
 		gen.AddTx(signedTxn)
+		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("failed to generate block for contract transaction: %w", err)
@@ -761,7 +785,7 @@ func (s *ETHTestServer) Mine() error {
 }
 
 func (s *ETHTestServer) mineBlock() error {
-	_, _, err := s.GenBlocks(1, func(i int, block *core.BlockGen) {
+	_, _, err := s.GenBlocks(1, func(i int, block *core.BlockGen) error {
 		latestBlockHeader := s.ethereum.BlockChain().CurrentBlock()
 
 		txPool := s.ethereum.TxPool()
@@ -785,15 +809,11 @@ func (s *ETHTestServer) mineBlock() error {
 			}
 		}
 
-		if len(selectedTxs) == 0 {
-			//slog.Debug("No transactions selected for mining", "gasUsed", gasUsed, "blockGasLimit", blockGasLimit)
-			return
-		}
-
 		for _, tx := range selectedTxs {
-			//slog.Debug("Adding transaction to block", "txHash", tx.Hash().Hex(), "gasUsed", tx.Gas(), "blockGasLimit", blockGasLimit)
 			block.AddTx(tx)
 		}
+
+		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("failed to generate block: %w", err)
