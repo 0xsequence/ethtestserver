@@ -61,7 +61,8 @@ type ETHTestServer struct {
 	stateDB   *cockroachdbpebble.DB // State database for the test server
 	stateDBMu sync.Mutex            // Mutex to protect stateDB access
 
-	initialized bool // Whether the server has been initialized
+	initialized bool      // Whether the server has been initialized
+	startTime   time.Time // Time when the server started mining
 
 	node      *node.Node
 	ethereum  *eth.Ethereum
@@ -77,7 +78,8 @@ type ETHTestServerConfig struct {
 	AutoMining bool          // Whether to enable mining on the test server
 	MineRate   time.Duration // How often to mine a new block
 
-	MaxBlockNum uint64 // Maximum block number for the test server, defaults to unlimited
+	MaxBlockNum uint64        // Maximum block number for the test server, defaults to unlimited
+	MaxDuration time.Duration // Maximum duration to run mining, defaults to unlimited
 
 	ChainID *big.Int // Chain ID for the test server
 	DataDir string   // Directory to store the blockchain data
@@ -189,16 +191,18 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		config.Genesis.Timestamp = config.InitialTimestamp
 
 		// persist genesis config to disk
-		if err := os.MkdirAll(config.DataDir, 0755); err != nil {
-			return nil, fmt.Errorf("failed to create data directory %s: %w", config.DataDir, err)
-		}
+		if config.DataDir != "" {
+			if err := os.MkdirAll(config.DataDir, 0755); err != nil {
+				return nil, fmt.Errorf("failed to create data directory %s: %w", config.DataDir, err)
+			}
 
-		buf, err := json.MarshalIndent(config.Genesis, "", "  ")
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal genesis config: %w", err)
-		}
-		if err := os.WriteFile(genesisPath, buf, 0644); err != nil {
-			return nil, fmt.Errorf("failed to write genesis config to %s: %w", genesisPath, err)
+			buf, err := json.MarshalIndent(config.Genesis, "", "  ")
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal genesis config: %w", err)
+			}
+			if err := os.WriteFile(genesisPath, buf, 0644); err != nil {
+				return nil, fmt.Errorf("failed to write genesis config to %s: %w", genesisPath, err)
+			}
 		}
 	}
 
@@ -346,6 +350,9 @@ func (s *ETHTestServer) Run(ctx context.Context) error {
 		return fmt.Errorf("ETHTestServer: failed to start Geth node: %w", err)
 	}
 
+	// Record the start time for mining duration tracking
+	s.startTime = time.Now()
+
 	go func() {
 		if !s.config.AutoMining {
 			slog.Info("AutoMining is disabled, skipping block generation")
@@ -355,10 +362,29 @@ func (s *ETHTestServer) Run(ctx context.Context) error {
 		ticker := time.NewTicker(s.config.MineRate)
 		defer ticker.Stop()
 
+		// Create a timeout timer if MaxDuration is set
+		var timeoutTimer *time.Timer
+		var timeoutChan <-chan time.Time
+		if s.config.MaxDuration > 0 {
+			timeoutTimer = time.NewTimer(s.config.MaxDuration)
+			timeoutChan = timeoutTimer.C
+			defer timeoutTimer.Stop()
+
+			slog.Info("Mining will stop after duration",
+				"maxDuration", s.config.MaxDuration,
+				"stopTime", s.startTime.Add(s.config.MaxDuration).Format(time.RFC3339))
+		}
+
 		for {
 			select {
 			case <-ctx.Done():
 				slog.Info("Stopping mining due to context cancellation")
+				return
+			case <-timeoutChan:
+				elapsed := time.Since(s.startTime)
+				slog.Info("Stopping mining due to maximum duration reached",
+					"maxDuration", s.config.MaxDuration,
+					"elapsed", elapsed)
 				return
 			case <-ticker.C:
 				err := s.mineBlock()
@@ -371,6 +397,43 @@ func (s *ETHTestServer) Run(ctx context.Context) error {
 	}()
 
 	return nil
+}
+
+func (s *ETHTestServer) MiningStats() map[string]interface{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bc := s.ethereum.BlockChain()
+	currentBlock := bc.CurrentBlock().Number.Uint64()
+
+	status := map[string]interface{}{
+		"autoMining":   s.config.AutoMining,
+		"currentBlock": currentBlock,
+		"maxBlockNum":  s.config.MaxBlockNum,
+		"maxDuration":  s.config.MaxDuration,
+		"mineRate":     s.config.MineRate,
+	}
+
+	if !s.startTime.IsZero() {
+		elapsed := time.Since(s.startTime)
+		status["startTime"] = s.startTime.Format(time.RFC3339)
+		status["elapsed"] = elapsed
+
+		if s.config.MaxDuration > 0 {
+			remaining := s.config.MaxDuration - elapsed
+			if remaining < 0 {
+				remaining = 0
+			}
+			status["remainingTime"] = remaining
+			status["timeExpired"] = elapsed >= s.config.MaxDuration
+		}
+
+		if s.config.MaxBlockNum > 0 {
+			status["blockLimitReached"] = currentBlock >= s.config.MaxBlockNum
+		}
+	}
+
+	return status
 }
 
 func (s *ETHTestServer) Commit() common.Hash {
@@ -427,7 +490,6 @@ func (s *ETHTestServer) RetrieveValue(key string, value interface{}) (bool, erro
 		if errors.Is(err, cockroachdbpebble.ErrNotFound) {
 			return false, nil // Key not found
 		}
-
 		return false, fmt.Errorf("failed to get state for key %s: %w", key, err)
 	}
 
@@ -509,8 +571,17 @@ func (s *ETHTestServer) GenBlocks(n int, gen func(int, *core.BlockGen)) ([]*type
 	latestBlockHeader := bc.CurrentBlock()
 	latestBlock := bc.GetBlock(latestBlockHeader.Hash(), latestBlockHeader.Number.Uint64())
 
+	// Check block number limit
 	if latestBlock.Number().Uint64() >= s.config.MaxBlockNum && s.config.MaxBlockNum > 0 {
 		return nil, nil, fmt.Errorf("ETHTestServer: reached maximum block number %d", s.config.MaxBlockNum)
+	}
+
+	// Check time limit
+	if s.config.MaxDuration > 0 && !s.startTime.IsZero() {
+		elapsed := time.Since(s.startTime)
+		if elapsed >= s.config.MaxDuration {
+			return nil, nil, fmt.Errorf("ETHTestServer: reached maximum duration %v (elapsed: %v)", s.config.MaxDuration, elapsed)
+		}
 	}
 
 	blocks, receipts := core.GenerateChain(
@@ -653,10 +724,30 @@ func (s *ETHTestServer) PrintStatus() {
 	defer s.mu.Unlock()
 
 	bc := s.ethereum.BlockChain()
-	slog.Info("ETHTestServer Status",
-		"latestBlock", bc.CurrentBlock().Number,
+	currentBlock := bc.CurrentBlock().Number.Uint64()
+
+	logFields := []interface{}{
+		"latestBlock", currentBlock,
 		"latestBlockHash", bc.CurrentBlock().Hash().Hex(),
-	)
+	}
+
+	if s.config.MaxBlockNum > 0 {
+		logFields = append(logFields, "maxBlockNum", s.config.MaxBlockNum)
+		logFields = append(logFields, "blocksRemaining", s.config.MaxBlockNum-currentBlock)
+	}
+
+	if s.config.MaxDuration > 0 && !s.startTime.IsZero() {
+		elapsed := time.Since(s.startTime)
+		remaining := s.config.MaxDuration - elapsed
+		if remaining < 0 {
+			remaining = 0
+		}
+		logFields = append(logFields, "maxDuration", s.config.MaxDuration)
+		logFields = append(logFields, "elapsed", elapsed)
+		logFields = append(logFields, "timeRemaining", remaining)
+	}
+
+	slog.Info("ETHTestServer Status", logFields...)
 }
 
 // Mine triggers a block mining operation that will include all pending
