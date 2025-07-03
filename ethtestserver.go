@@ -12,7 +12,6 @@ import (
 	"os"
 	"path"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/0xsequence/ethkit/ethartifact"
@@ -70,8 +69,6 @@ type ETHTestServer struct {
 
 	engine consensus.Engine // Consensus engine used by the test server
 	db     ethdb.Database   // Database used by the test server
-
-	provider atomic.Value // Provider for the test server, initialized lazily
 
 	beacon *catalyst.SimulatedBeacon
 }
@@ -366,7 +363,8 @@ func (s *ETHTestServer) Run(ctx context.Context) error {
 			case <-ticker.C:
 				err := s.mineBlock()
 				if err != nil {
-					slog.Error("Failed to mine block", "error", err)
+					slog.Error("Failed to mine block, stopping mining", "error", err)
+					return
 				}
 			}
 		}
@@ -754,7 +752,7 @@ func makeKeyValueStore(config *ETHTestServerConfig, stack *node.Node, options *n
 		options.ReadOnly,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open pebbe database: %w", err)
+		return nil, fmt.Errorf("failed to open pebble database: %w", err)
 	}
 
 	return kvdb, nil
@@ -763,7 +761,7 @@ func makeKeyValueStore(config *ETHTestServerConfig, stack *node.Node, options *n
 func openDatabase(config *ETHTestServerConfig, stack *node.Node, readOnly bool) (ethdb.Database, error) {
 	options := node.DatabaseOptions{
 		ReadOnly:          readOnly,
-		Cache:             32 * 1024 * 1024,
+		Cache:             128 * 1024 * 1024,
 		Handles:           128,
 		MetricsNamespace:  "eth/db/chaindata",
 		AncientsDirectory: stack.ResolveAncient(chainDataDir, ""),
