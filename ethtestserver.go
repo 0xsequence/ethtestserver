@@ -613,7 +613,7 @@ func (s *ETHTestServer) HTTPEndpoint() string {
 	return s.node.HTTPEndpoint()
 }
 
-func (s *ETHTestServer) DeployContract(ctx context.Context, signer *Signer, contractName string, constructorArgs ...interface{}) (*ETHContractCaller, error) {
+func (s *ETHTestServer) DeployContract(signer *Signer, contractName string, constructorArgs ...interface{}) (*ETHContractCaller, error) {
 	artifact, ok := s.artifacts.Get(contractName)
 	if !ok {
 		return nil, fmt.Errorf("contract %s not found in registry", contractName)
@@ -678,7 +678,7 @@ func (s *ETHTestServer) DeployContract(ctx context.Context, signer *Signer, cont
 	}, nil
 }
 
-func (s *ETHTestServer) ContractTransact(ctx context.Context, signer *Signer, contract *ETHContractCaller, methodName string, methodArgs ...interface{}) error {
+func (s *ETHTestServer) ContractTransact(signer *Signer, contract *ETHContractCaller, methodName string, methodArgs ...interface{}) error {
 	if signer == nil {
 		return fmt.Errorf("signer cannot be nil")
 	}
@@ -692,7 +692,7 @@ func (s *ETHTestServer) ContractTransact(ctx context.Context, signer *Signer, co
 		return fmt.Errorf("failed to pack contract method call: %w", err)
 	}
 
-	_, _, err = s.GenBlocks(1, func(i int, gen *core.BlockGen) {
+	_, receipts, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) {
 		nonce := gen.TxNonce(signer.Address())
 
 		tx := types.NewTransaction(
@@ -714,6 +714,10 @@ func (s *ETHTestServer) ContractTransact(ctx context.Context, signer *Signer, co
 	})
 	if err != nil {
 		return fmt.Errorf("failed to generate block for contract transaction: %w", err)
+	}
+
+	if len(receipts) == 0 || len(receipts[0]) == 0 {
+		return fmt.Errorf("no receipts found for contract transaction")
 	}
 
 	return nil
@@ -791,7 +795,6 @@ func (s *ETHTestServer) mineBlock() error {
 			block.AddTx(tx)
 		}
 	})
-
 	if err != nil {
 		return fmt.Errorf("failed to generate block: %w", err)
 	}

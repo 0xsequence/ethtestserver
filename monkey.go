@@ -151,9 +151,12 @@ func (m *MonkeyOperator) Run(ctx context.Context) error {
 						}
 					}
 				})
+
 				if err != nil {
-					slog.Error("MonkeyOperator: failed to generate blocks", "error", err)
-					continue
+					slog.Error("MonkeyOperator: failed to generate blocks, stopping", "error", err)
+					m.running.Store(false)
+					m.done <- struct{}{}
+					return
 				}
 
 				if ticks >= m.config.Ticks && m.config.Ticks > 0 {

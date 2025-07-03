@@ -88,7 +88,6 @@ func main() {
 	server, err := ethtestserver.NewETHTestServer(config)
 	if err != nil {
 		slog.Error("Failed to create test server", "error", err)
-		os.Exit(1)
 		return
 	}
 
@@ -109,7 +108,6 @@ func main() {
 		monkeyTransferor, err := runMonkeyTransferors(ctx, server, knownWallets, knownWallets)
 		if err != nil {
 			slog.Error("Failed to run monkey transferors", "error", err)
-			os.Exit(1)
 			return
 		}
 
@@ -122,7 +120,6 @@ func main() {
 		monkeyERC1155Transferor, err := runMonkeyERC1155Transferors(ctx, server, knownWallets, knownWallets, 1, 256, 1000)
 		if err != nil {
 			slog.Error("Failed to run monkey ERC1155 transferors", "error", err)
-			os.Exit(1)
 			return
 		}
 
@@ -135,7 +132,6 @@ func main() {
 		monkeyERC20Transferor, err := runMonkeyERC20Transferors(ctx, server, knownWallets, knownWallets, 10_000)
 		if err != nil {
 			slog.Error("Failed to run monkey ERC20 transferors", "error", err)
-			os.Exit(1)
 			return
 		}
 
@@ -148,7 +144,6 @@ func main() {
 		monkeyERC721Transferor, err := runMonkeyERC721Transferors(ctx, server, knownWallets, knownWallets, 256)
 		if err != nil {
 			slog.Error("Failed to run monkey ERC721 transferors", "error", err)
-			os.Exit(1)
 			return
 		}
 

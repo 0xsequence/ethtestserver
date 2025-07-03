@@ -86,7 +86,6 @@ func runMonkeyERC1155Transferors(ctx context.Context, server *ethtestserver.ETHT
 		slog.Info("Deploying ERC1155 contract for monkey transfers")
 		contractDeployer := senders[0]
 		erc1155Contract, err = server.DeployContract(
-			ctx,
 			contractDeployer,
 			ERC1155TestTokenArtifact.ContractName,
 			contractDeployer.Address(),
@@ -115,7 +114,6 @@ func runMonkeyERC1155Transferors(ctx context.Context, server *ethtestserver.ETHT
 			for _, s := range senders {
 				slog.Info("Minting ERC1155 tokens", "recipient", s.Address().Hex())
 				err = server.ContractTransact(
-					ctx,
 					senders[0],
 					erc1155Contract,
 					"mint",
@@ -219,7 +217,6 @@ func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTes
 		contractRecipient := senders[0]
 		contractInitialOwner := senders[0]
 		erc20Contract, err = server.DeployContract(
-			ctx,
 			contractDeployer,
 			ERC20TestTokenArtifact.ContractName,
 			contractRecipient.Address(),
@@ -248,7 +245,6 @@ func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTes
 		// Mint tokens for each sender.
 		for _, s := range senders {
 			err = server.ContractTransact(
-				ctx,
 				senders[0], // using the initial owner as sender for minting
 				erc20Contract,
 				"mint",
@@ -339,7 +335,6 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 		slog.Info("Deploying ERC721 contract for monkey transfers")
 		contractDeployer := ethtestserver.PickRandomSigner(senders)
 		erc721Contract, err = server.DeployContract(
-			ctx,
 			contractDeployer,
 			ERC721TestTokenArtifact.ContractName,
 			contractDeployer.Address(),
@@ -372,7 +367,6 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 		for i := 0; i < mintedTokens; i++ {
 			for _, s := range senders {
 				err = server.ContractTransact(
-					ctx,
 					senders[0], // using a deployer or designated minter
 					erc721Contract,
 					"safeMint",
