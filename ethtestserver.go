@@ -87,6 +87,7 @@ type ETHTestServer struct {
 	beacon *catalyst.SimulatedBeacon
 }
 
+// ETHTestServerStats contains statistics about the ETHTestServer's mining activity.
 type ETHTestServerStats struct {
 	BlocksMined      uint64        // Total number of blocks mined
 	TxCount          uint64        // Total number of transactions processed
