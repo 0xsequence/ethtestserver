@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"math/rand"
 	"os"
 	"path"
 	"sync"
@@ -44,16 +45,17 @@ import (
 )
 
 const (
-	chainDataDir = "chaindata" // Default directory for chain data
-
+	chainDataDir = "chaindata"           // Default directory for chain data
 	storeDataDir = "ethtestserver.state" // Default directory for the test server data
 )
 
+// ETHContractCaller represents a deployed contract
 type ETHContractCaller struct {
 	Address common.Address // Address of the contract
 	ABI     abi.ABI
 }
 
+// ETHTestServer contains the test server state and configuration
 type ETHTestServer struct {
 	mu sync.Mutex
 
@@ -74,6 +76,7 @@ type ETHTestServer struct {
 	beacon *catalyst.SimulatedBeacon
 }
 
+// ETHTestServerConfig represents the configuration for ETHTestServer.
 type ETHTestServerConfig struct {
 	AutoMining bool          // Whether to enable mining on the test server
 	MineRate   time.Duration // How often to mine a new block
@@ -120,6 +123,21 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		config = &ETHTestServerConfig{}
 	}
 
+	// Validate the configuration parameters
+	if config.ReorgProbability < 0 || config.ReorgProbability > 1 {
+		return nil, fmt.Errorf("ReorgProbability must be between 0 and 1, got %f", config.ReorgProbability)
+	}
+
+	if config.ReorgProbability > 0 {
+		if config.ReorgDepthMin <= 0 {
+			return nil, fmt.Errorf("ReorgDepthMin must be greater than 0 when ReorgProbability > 0, got %d", config.ReorgDepthMin)
+		}
+		if config.ReorgDepthMax < config.ReorgDepthMin {
+			return nil, fmt.Errorf("ReorgDepthMax must be >= ReorgDepthMin, got %d < %d", config.ReorgDepthMax, config.ReorgDepthMin)
+		}
+	}
+
+	// Initialization
 	initialized := false
 	if config.DBMode != "memory" && config.DataDir == "" {
 		config.DataDir = "ethereum" // Default data directory
@@ -435,6 +453,13 @@ func (s *ETHTestServer) MiningStats() map[string]interface{} {
 	}
 
 	return status
+}
+
+// simulateFork is used to simulate a reorg/fork by removing the last N blocks.
+func (s *ETHTestServer) simulateFork(blocksBehind int) error {
+	// TODO: implement a simulated fork by removing the last N blocks.
+	slog.Info("Simulating fork", "blocksBehind", blocksBehind)
+	return nil
 }
 
 func (s *ETHTestServer) Commit() common.Hash {
@@ -817,6 +842,33 @@ func (s *ETHTestServer) mineBlock() error {
 	})
 	if err != nil {
 		return fmt.Errorf("failed to generate block: %w", err)
+	}
+
+	if s.config.ReorgProbability > 0 {
+		if rand.Float64() < s.config.ReorgProbability {
+
+			depthRange := s.config.ReorgDepthMax - s.config.ReorgDepthMin + 1
+			var depth int
+			if depthRange > 1 {
+				depth = rand.Intn(depthRange) + s.config.ReorgDepthMin
+			} else {
+				depth = s.config.ReorgDepthMin
+			}
+
+			bc := s.ethereum.BlockChain()
+			currentHeight := int(bc.CurrentBlock().Number.Uint64())
+			if depth >= currentHeight {
+				depth = currentHeight - 1
+			}
+
+			if depth > 0 {
+				if err := s.simulateFork(depth); err != nil {
+					return fmt.Errorf("failed to simulate fork: %w", err)
+				}
+			} else {
+				slog.Info("Not enough blocks to simulate a fork", "chainHeight", currentHeight)
+			}
+		}
 	}
 
 	return nil
