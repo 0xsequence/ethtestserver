@@ -45,8 +45,19 @@ import (
 )
 
 const (
-	chainDataDir = "chaindata"           // Default directory for chain data
-	storeDataDir = "ethtestserver.state" // Default directory for the test server data
+	defaultDataDir = "data"
+
+	chainDataDir = "chain" // Default directory for chain data
+	storeDataDir = "state" // Default directory for the test server data
+)
+
+const (
+	dbModeMemory = "memory"
+	dbModeDisk   = "disk"
+)
+
+var (
+	defaultLogLevel = slog.LevelDebug
 )
 
 // ETHContractCaller represents a deployed contract
@@ -59,7 +70,7 @@ type ETHContractCaller struct {
 type ETHTestServer struct {
 	mu sync.Mutex
 
-	config    ETHTestServerConfig
+	config    *ETHTestServerConfig
 	stateDB   *cockroachdbpebble.DB // State database for the test server
 	stateDBMu sync.Mutex            // Mutex to protect stateDB access
 
@@ -85,7 +96,7 @@ type ETHTestServerConfig struct {
 	MaxDuration time.Duration // Maximum duration to run mining, defaults to unlimited
 
 	ChainID *big.Int // Chain ID for the test server
-	DataDir string   // Directory to store the blockchain data
+	DataDir string   // Directory to store persistent data (e.g., chain data, state, genesis)
 	DBMode  string   // Database mode for the test server (e.g., "memory", "disk")
 
 	InitialSigners   []*Signer                   // Initial signers for the test server
@@ -111,19 +122,40 @@ type ETHTestServerConfig struct {
 
 // NewETHTestServer creates a new Ethereum test server with the given configuration.
 func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
-	s := &ETHTestServer{}
-
-	var err error
-	s.stateDB, err = cockroachdbpebble.Open(storeDataDir, &cockroachdbpebble.Options{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create state store: %w", err)
-	}
-
 	if config == nil {
 		config = &ETHTestServerConfig{}
 	}
 
-	// Validate the configuration parameters
+	s := &ETHTestServer{
+		config: config,
+	}
+
+	// default to disk mode if not specified, or if an invalid mode is provided
+	if config.DBMode != dbModeMemory && config.DBMode != dbModeDisk {
+		config.DBMode = dbModeDisk
+	}
+
+	if config.DataDir == "" {
+		config.DataDir = defaultDataDir
+	}
+
+	// make sure the data directory exists
+	if config.DBMode == dbModeDisk {
+		if err := os.MkdirAll(config.DataDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create data directory %s: %w", config.DataDir, err)
+		}
+	}
+
+	var err error
+	s.stateDB, err = cockroachdbpebble.Open(
+		s.resolvePath(storeDataDir),
+		&cockroachdbpebble.Options{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create state store: %w", err)
+	}
+
+	// Validate configuration and set defaults
 	if config.ReorgProbability < 0 || config.ReorgProbability > 1 {
 		return nil, fmt.Errorf("ReorgProbability must be between 0 and 1, got %f", config.ReorgProbability)
 	}
@@ -137,30 +169,54 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		}
 	}
 
-	// Initialization
-	initialized := false
-	if config.DBMode != "memory" && config.DataDir == "" {
-		config.DataDir = "ethereum" // Default data directory
-	}
-
-	if config.DBMode == "memory" {
-		config.DataDir = ""
-	} else {
-		dataDirStat, err := os.Stat(config.DataDir)
-		if err == nil && !dataDirStat.IsDir() {
-			return nil, fmt.Errorf("data directory %s exists but is not a directory", config.DataDir)
-		}
-
-		initialized = dataDirStat != nil && dataDirStat.IsDir()
-	}
-
 	if config.MineRate == 0 {
 		config.MineRate = 1 * time.Second // Default mine rate
 	}
 
-	var genesisPath string
-	if config.DataDir != "" {
-		genesisPath = path.Join(config.DataDir, "genesis.json")
+	if config.HTTPHost == "" {
+		config.HTTPHost = "127.0.0.1"
+	}
+
+	if config.HTTPPort == 0 {
+		config.HTTPPort = 0
+	}
+
+	if config.NodeConfig == nil {
+		config.NodeConfig = &node.Config{}
+	}
+
+	// override node config with custom values
+	config.NodeConfig.Name = "main"
+	config.NodeConfig.DataDir = s.resolvePath(chainDataDir)
+	config.NodeConfig.HTTPHost = config.HTTPHost
+	config.NodeConfig.HTTPPort = config.HTTPPort
+	config.NodeConfig.HTTPModules = []string{"eth", "net", "web3", "txpool"}
+	config.NodeConfig.Logger = log.NewLogger(
+		slog.NewJSONHandler(
+			os.Stdout,
+			&slog.HandlerOptions{
+				Level: defaultLogLevel,
+			},
+		),
+	)
+
+	if config.ServiceConfig == nil {
+		config.ServiceConfig = &ethconfig.Defaults
+	}
+
+	// Initialization
+	initialized := false
+	genesisPath := s.resolvePath("genesis.json")
+
+	if config.DBMode == dbModeDisk {
+		genesisStat, err := os.Stat(genesisPath)
+		if err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("failed to check genesis config file %s: %w", genesisPath, err)
+		}
+
+		if err == nil && genesisStat.Size() > 0 {
+			initialized = true
+		}
 	}
 
 	if initialized {
@@ -209,11 +265,7 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		config.Genesis.Timestamp = config.InitialTimestamp
 
 		// persist genesis config to disk
-		if config.DataDir != "" {
-			if err := os.MkdirAll(config.DataDir, 0755); err != nil {
-				return nil, fmt.Errorf("failed to create data directory %s: %w", config.DataDir, err)
-			}
-
+		if config.DBMode == dbModeDisk {
 			buf, err := json.MarshalIndent(config.Genesis, "", "  ")
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal genesis config: %w", err)
@@ -224,38 +276,9 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		}
 	}
 
-	if config.HTTPHost == "" {
-		config.HTTPHost = "127.0.0.1"
-	}
-
-	if config.HTTPPort == 0 {
-		config.HTTPPort = 0
-	}
-
-	if config.NodeConfig == nil {
-		config.NodeConfig = &node.Config{}
-	}
-
-	// override node config with custom values
-	config.NodeConfig.Name = "ethtestserver"
-	config.NodeConfig.HTTPHost = config.HTTPHost
-	config.NodeConfig.HTTPPort = config.HTTPPort
-	config.NodeConfig.HTTPModules = []string{"eth", "net", "web3", "txpool"}
-	config.NodeConfig.Logger = log.NewLogger(
-		slog.NewJSONHandler(
-			os.Stdout,
-			&slog.HandlerOptions{Level: slog.LevelDebug},
-		),
-	)
-	config.NodeConfig.DataDir = config.DataDir
-
 	stack, err := node.New(config.NodeConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Geth node: %w", err)
-	}
-
-	if config.ServiceConfig == nil {
-		config.ServiceConfig = &ethconfig.Defaults
 	}
 
 	// override service config with custom values
@@ -265,7 +288,7 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	config.ServiceConfig.FilterLogCacheSize = 1000
 
 	if !initialized {
-		db, err := openDatabase(config, stack, false)
+		db, err := s.openDatabase(stack, false)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open chain database: %w", err)
 		}
@@ -325,7 +348,6 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 
 	engine := beacon.New(ethash.NewFaker()) // Use a fake ethash engine for testing
 
-	s.config = *config
 	s.node = stack
 	s.ethereum = service
 	s.beacon = simBeacon
@@ -619,7 +641,6 @@ func (s *ETHTestServer) GenBlocks(n int, blockGenFn func(int, *core.BlockGen) er
 	}
 
 	var genErr error
-
 	blocks, receipts := core.GenerateChain(
 		s.config.Genesis.Config,
 		latestBlock,
@@ -878,6 +899,13 @@ func (s *ETHTestServer) mineBlock() error {
 	return nil
 }
 
+func (s *ETHTestServer) resolvePath(relPath ...string) string {
+	resolved := path.Join(s.config.DataDir, path.Join(relPath...))
+	log.Info("Resolved path", "path", resolved)
+
+	return resolved
+}
+
 func (s *ETHTestServer) waitForTxIndexing(ctx context.Context) error {
 	timeout := time.NewTimer(30 * time.Second)
 	defer timeout.Stop()
@@ -900,7 +928,7 @@ func (s *ETHTestServer) waitForTxIndexing(ctx context.Context) error {
 	}
 }
 
-func makeKeyValueStore(config *ETHTestServerConfig, stack *node.Node, options *node.DatabaseOptions) (ethdb.KeyValueStore, error) {
+func (s *ETHTestServer) makeKeyValueStore(stack *node.Node, options *node.DatabaseOptions) (ethdb.KeyValueStore, error) {
 	if stack == nil {
 		return nil, fmt.Errorf("stack cannot be nil")
 	}
@@ -909,13 +937,13 @@ func makeKeyValueStore(config *ETHTestServerConfig, stack *node.Node, options *n
 		return nil, fmt.Errorf("options cannot be nil")
 	}
 
-	if config.DBMode == "memory" || config.DataDir == "" {
+	if s.config.DBMode == dbModeMemory {
 		// Use an in-memory database for testing, this database is always created
 		return memorydb.New(), nil
 	}
 
 	kvdb, err := pebble.New(
-		stack.ResolvePath(chainDataDir),
+		stack.ResolvePath("chaindata"),
 		options.Cache,
 		options.Handles,
 		options.MetricsNamespace,
@@ -928,16 +956,15 @@ func makeKeyValueStore(config *ETHTestServerConfig, stack *node.Node, options *n
 	return kvdb, nil
 }
 
-func openDatabase(config *ETHTestServerConfig, stack *node.Node, readOnly bool) (ethdb.Database, error) {
+func (s *ETHTestServer) openDatabase(stack *node.Node, readOnly bool) (ethdb.Database, error) {
 	options := node.DatabaseOptions{
 		ReadOnly:          readOnly,
 		Cache:             128 * 1024 * 1024,
 		Handles:           128,
-		MetricsNamespace:  "eth/db/chaindata",
-		AncientsDirectory: stack.ResolveAncient(chainDataDir, ""),
+		AncientsDirectory: stack.ResolveAncient("chaindata", ""),
 	}
 
-	kvdb, err := makeKeyValueStore(config, stack, &options)
+	kvdb, err := s.makeKeyValueStore(stack, &options)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create key-value store: %w", err)
 	}
