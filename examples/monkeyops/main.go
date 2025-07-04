@@ -55,12 +55,12 @@ func main() {
 		HTTPHost:         "localhost",
 		HTTPPort:         8545,
 		InitialSigners:   knownWallets,
-		ReorgProbability: 0.1, // 10% chance of reorgs
+		ReorgProbability: 0.01, // 1% chance of reorgs
 
 		ReorgDepthMin: 3, // minimum depth for reorgs
 		ReorgDepthMax: 6, // maximum depth for reorgs
 
-		DBMode: "disk", // memory", // Use in-memory database for testing
+		DBMode: "disk",
 		InitialBalances: map[common.Address]*big.Int{
 			wallet0.Address(): initialBalance,
 			wallet1.Address(): initialBalance,
@@ -80,7 +80,7 @@ func main() {
 		},
 	}
 
-	// generate a large number of additional monkey signers
+	// generate a large number of additional accounts
 	monkeySigners := ethtestserver.GenSigners(500)
 
 	// add monkey signers to the config so they can be used in the test server

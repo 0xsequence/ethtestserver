@@ -15,7 +15,7 @@ import (
 
 var (
 	defaultMonkeyOperatorTickerInterval       = 100 * time.Millisecond // Default interval for executing operations
-	defaultMonkeyOperatorTransactionsPerBlock = 20                     // Default transactions per block
+	defaultMonkeyOperatorTransactionsPerBlock = 50                     // Default transactions per block
 )
 
 type MonkeyOperatorConfig struct {
@@ -37,7 +37,11 @@ type MonkeyOperator struct {
 	stopOnce sync.Once
 }
 
-func NewMonkeyOperator(config *MonkeyOperatorConfig, blockGen operator.BlockGenerator, txGen operator.TransactionGenerator) (*MonkeyOperator, error) {
+func NewMonkeyOperator(blockGen operator.BlockGenerator, txGen operator.TransactionGenerator) (*MonkeyOperator, error) {
+	return NewMonkeyOperatorWithConfig(&MonkeyOperatorConfig{}, blockGen, txGen)
+}
+
+func NewMonkeyOperatorWithConfig(config *MonkeyOperatorConfig, blockGen operator.BlockGenerator, txGen operator.TransactionGenerator) (*MonkeyOperator, error) {
 	if txGen == nil {
 		return nil, fmt.Errorf("MonkeyOperator: transaction generator is required")
 	}
@@ -47,7 +51,7 @@ func NewMonkeyOperator(config *MonkeyOperatorConfig, blockGen operator.BlockGene
 	}
 
 	if config == nil {
-		config = &MonkeyOperatorConfig{}
+		return nil, fmt.Errorf("MonkeyOperator: configuration is required")
 	}
 
 	if config.TickerInterval <= 0 {

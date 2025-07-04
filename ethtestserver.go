@@ -397,7 +397,7 @@ func (s *ETHTestServer) Run(ctx context.Context) error {
 
 	if !s.initialized {
 		// Generate the first empty block to initialize the chain.
-		if _, _, err := s.GenBlocks(1, nil); err != nil {
+		if _, _, err := s.GenerateBlocks(1, nil); err != nil {
 			return fmt.Errorf("ETHTestServer: failed to generate initial block: %w", err)
 		}
 	}
@@ -599,8 +599,8 @@ func (s *ETHTestServer) DeleteValue(key string) error {
 	return nil
 }
 
-// GenBlocks generates n blocks using the provided block generation function.
-func (s *ETHTestServer) GenBlocks(n int, blockGenFn func(int, *core.BlockGen) error) ([]*types.Block, []types.Receipts, error) {
+// GenerateBlocks generates n blocks using the provided block generation function.
+func (s *ETHTestServer) GenerateBlocks(n int, blockGenFn func(int, *core.BlockGen) error) ([]*types.Block, []types.Receipts, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -689,7 +689,7 @@ func (s *ETHTestServer) DeployContract(signer *Signer, contractName string, cons
 
 	calldata = append(calldata, input...)
 
-	_, receipts, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) error {
+	_, receipts, err := s.GenerateBlocks(1, func(i int, gen *core.BlockGen) error {
 		nonce := gen.TxNonce(signer.Address())
 		tx := types.NewContractCreation(
 			nonce,
@@ -743,7 +743,7 @@ func (s *ETHTestServer) ContractTransact(signer *Signer, contract *ETHContractCa
 		return fmt.Errorf("failed to pack contract method call: %w", err)
 	}
 
-	_, receipts, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) error {
+	_, receipts, err := s.GenerateBlocks(1, func(i int, gen *core.BlockGen) error {
 		nonce := gen.TxNonce(signer.Address())
 		tx := types.NewTransaction(
 			nonce,
@@ -812,10 +812,10 @@ func (s *ETHTestServer) Mine() error {
 	return s.mineBlock()
 }
 
-// mineBlock generates one block (using GenBlocks), optionally simulates a fork,
+// mineBlock generates one block (using GenerateBlocks), optionally simulates a fork,
 // and then updates the stats.
 func (s *ETHTestServer) mineBlock() error {
-	_, _, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) error {
+	_, _, err := s.GenerateBlocks(1, func(i int, gen *core.BlockGen) error {
 		latestBlockHeader := s.ethereum.BlockChain().CurrentBlock()
 		txPool := s.ethereum.TxPool()
 		pending := txPool.Pending(txpool.PendingFilter{})
