@@ -13,11 +13,13 @@ import (
 	"os"
 	"path"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/0xsequence/ethkit/ethartifact"
 	"github.com/0xsequence/ethkit/go-ethereum/accounts/abi"
 
+	"github.com/0xsequence/runnable"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/beacon"
@@ -110,7 +112,8 @@ type ETHTestServerConfig struct {
 
 // ETHTestServer contains the test server state and configuration.
 type ETHTestServer struct {
-	mu sync.Mutex
+	mu      sync.Mutex
+	running atomic.Bool // Indicates if the server is currently running
 
 	config    *ETHTestServerConfig
 	stateDB   *cockroachdbpebble.DB // State database for the test server
@@ -387,10 +390,28 @@ func (s *ETHTestServer) Stats() ETHTestServerStats {
 	return s.stats
 }
 
+func (s *ETHTestServer) IsRunning() bool {
+	if s == nil {
+		return false
+	}
+
+	return s.running.Load()
+}
+
 func (s *ETHTestServer) Run(ctx context.Context) error {
+	if s == nil {
+		return fmt.Errorf("ETHTestServer: nil server instance")
+	}
+
+	if s.running.Load() {
+		return fmt.Errorf("ETHTestServer: server is already running")
+	}
+	s.running.Store(true)
+
 	if s.node == nil {
 		return fmt.Errorf("ETHTestServer: node not initialized")
 	}
+
 	if s.ethereum == nil {
 		return fmt.Errorf("ETHTestServer: ethereum service not initialized")
 	}
@@ -484,6 +505,15 @@ func (s *ETHTestServer) simulateFork(blockNumber int) error {
 }
 
 func (s *ETHTestServer) Stop(ctx context.Context) error {
+	if s == nil {
+		return fmt.Errorf("ETHTestServer: nil server instance")
+	}
+
+	if !s.running.Load() {
+		return fmt.Errorf("ETHTestServer: server is not running")
+	}
+	defer s.running.Store(false)
+
 	var errs []error
 
 	s.stateDBMu.Lock()
@@ -956,3 +986,5 @@ func (s *ETHTestServer) openDatabase(stack *node.Node, readOnly bool) (ethdb.Dat
 
 	return db, nil
 }
+
+var _ runnable.Runnable = (*ETHTestServer)(nil)
