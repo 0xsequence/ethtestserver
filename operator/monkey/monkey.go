@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,14 +15,16 @@ import (
 )
 
 var (
-	defaultMonkeyOperatorTickerInterval       = 100 * time.Millisecond // Default interval for executing operations
-	defaultMonkeyOperatorTransactionsPerBlock = 50                     // Default transactions per block
+	defaultMonkeyOperatorTickerInterval       = 1 * time.Second // Default interval for executing operations
+	defaultMonkeyOperatorTransactionsPerBlock = 120             // Default transactions per block
 )
 
 type MonkeyOperatorConfig struct {
-	Ticks                int           // Number of ticks to run, 0 means infinite
-	TickerInterval       time.Duration // Interval between operations
-	TransactionsPerBlock int           // Number of transactions to generate per block
+	Ticks                   int           // Number of ticks to run, 0 means infinite
+	TickerInterval          time.Duration // Interval between operations
+	TransactionsPerBlock    int           // Number of transactions to generate per block
+	MinTransactionsPerBlock int           // Minimum number of transactions per block, if set to 0, it will use TransactionsPerBlock
+	MaxTransactionsPerBlock int           // Maximum number of transactions per block, if set to 0, it will use TransactionsPerBlock
 }
 
 type MonkeyOperator struct {
@@ -112,7 +115,12 @@ func (m *MonkeyOperator) Run(ctx context.Context) error {
 						return nil
 					}
 
-					for i := 0; i < m.config.TransactionsPerBlock; i++ {
+					transactionsPerBlock := m.config.TransactionsPerBlock
+					if m.config.MinTransactionsPerBlock > 0 && m.config.MaxTransactionsPerBlock > 0 {
+						transactionsPerBlock = m.config.MinTransactionsPerBlock + rand.Intn(m.config.MaxTransactionsPerBlock-m.config.MinTransactionsPerBlock+1)
+					}
+
+					for i := 0; i < transactionsPerBlock; i++ {
 						tx, err := m.txGen.GenerateTransaction(ctx, gen)
 						if err != nil {
 							return fmt.Errorf("failed to generate transaction: %w", err)

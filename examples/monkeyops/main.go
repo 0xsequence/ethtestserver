@@ -51,14 +51,14 @@ func main() {
 	}
 
 	config := &ethtestserver.ETHTestServerConfig{
-		AutoMining:       true,
-		HTTPHost:         "localhost",
-		HTTPPort:         8545,
-		InitialSigners:   knownWallets,
-		ReorgProbability: 0.01, // 1% chance of reorgs
+		AutoMining:     true,
+		HTTPHost:       "localhost",
+		HTTPPort:       8545,
+		InitialSigners: knownWallets,
 
-		ReorgDepthMin: 3, // minimum depth for reorgs
-		ReorgDepthMax: 6, // maximum depth for reorgs
+		ReorgProbability: 0.01, // 1% chance of reorgs
+		ReorgDepthMin:    3,    // minimum depth for reorgs
+		ReorgDepthMax:    6,    // maximum depth for reorgs
 
 		DBMode: "disk",
 		InitialBalances: map[common.Address]*big.Int{

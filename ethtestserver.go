@@ -880,10 +880,10 @@ func (s *ETHTestServer) resolvePath(relPath ...string) string {
 }
 
 func (s *ETHTestServer) waitForTxIndexing(ctx context.Context) error {
-	timeout := time.NewTimer(30 * time.Second)
+	timeout := time.NewTimer(5 * time.Second)
 	defer timeout.Stop()
 
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(2 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -932,8 +932,8 @@ func (s *ETHTestServer) makeKeyValueStore(stack *node.Node, options *node.Databa
 func (s *ETHTestServer) openDatabase(stack *node.Node, readOnly bool) (ethdb.Database, error) {
 	options := node.DatabaseOptions{
 		ReadOnly:          readOnly,
-		Cache:             128 * 1024 * 1024,
-		Handles:           128,
+		Cache:             512,
+		Handles:           512,
 		AncientsDirectory: stack.ResolveAncient("chaindata", ""),
 	}
 

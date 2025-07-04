@@ -7,14 +7,20 @@ import (
 	"math/big"
 	"math/rand"
 	"sync"
+	"time"
 
 	"github.com/0xsequence/ethtestserver"
 	"github.com/0xsequence/ethtestserver/operator/monkey"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/params"
 )
+
+var monkeyOperatorConfig = monkey.MonkeyOperatorConfig{
+	TickerInterval:          1 * time.Millisecond,
+	MinTransactionsPerBlock: 30,
+	MaxTransactionsPerBlock: 100,
+}
 
 type nativeTransactionGenerator struct {
 	senders    []*ethtestserver.Signer
@@ -52,8 +58,8 @@ func (n *nativeTransactionGenerator) GenerateTransaction(ctx context.Context, ge
 			nonce,
 			recipient.Address(),
 			amount,
-			params.TxGas,
-			big.NewInt(params.InitialBaseFee),
+			300_000,
+			gen.BaseFee(),
 			nil,
 		),
 		gen.Signer(),
@@ -289,12 +295,11 @@ func (g *ERC20TransactionGenerator) GenerateTransaction(ctx context.Context, gen
 	}
 
 	nonce := gen.TxNonce(sender.Address())
-	gasLimit := uint64(100_000)
 	tx := types.NewTransaction(
 		nonce,
 		common.Address(g.erc20Caller.Address),
 		nil,
-		gasLimit,
+		300_000,
 		gen.BaseFee(),
 		calldata,
 	)
@@ -425,12 +430,11 @@ func (g *ERC721TransactionGenerator) GenerateTransaction(ctx context.Context, ge
 	}
 
 	nonce := gen.TxNonce(sender.Address())
-	gasLimit := uint64(150_000)
 	tx := types.NewTransaction(
 		nonce,
 		common.Address(g.erc721Caller.Address),
 		nil,
-		gasLimit,
+		300_000,
 		gen.BaseFee(),
 		calldata,
 	)
@@ -459,7 +463,8 @@ func runMonkeyTransferors(ctx context.Context, server *ethtestserver.ETHTestServ
 		return nil, fmt.Errorf("failed to initialize native transaction generator: %w", err)
 	}
 
-	monkeyOperator, err := monkey.NewMonkeyOperator(
+	monkeyOperator, err := monkey.NewMonkeyOperatorWithConfig(
+		&monkeyOperatorConfig,
 		server,
 		txGen,
 	)
@@ -480,7 +485,8 @@ func runMonkeyERC1155Transferors(ctx context.Context, server *ethtestserver.ETHT
 		return nil, fmt.Errorf("failed to initialize ERC1155 transaction generator: %w", err)
 	}
 
-	monkeyOperator, err := monkey.NewMonkeyOperator(
+	monkeyOperator, err := monkey.NewMonkeyOperatorWithConfig(
+		&monkeyOperatorConfig,
 		server,
 		txGen,
 	)
@@ -501,7 +507,8 @@ func runMonkeyERC20Transferors(ctx context.Context, server *ethtestserver.ETHTes
 		return nil, fmt.Errorf("failed to initialize ERC20 transaction generator: %w", err)
 	}
 
-	monkeyOperator, err := monkey.NewMonkeyOperator(
+	monkeyOperator, err := monkey.NewMonkeyOperatorWithConfig(
+		&monkeyOperatorConfig,
 		server,
 		txGen,
 	)
@@ -522,7 +529,8 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 		return nil, fmt.Errorf("failed to initialize ERC721 transaction generator: %w", err)
 	}
 
-	monkeyOperator, err := monkey.NewMonkeyOperator(
+	monkeyOperator, err := monkey.NewMonkeyOperatorWithConfig(
+		&monkeyOperatorConfig,
 		server,
 		txGen,
 	)
