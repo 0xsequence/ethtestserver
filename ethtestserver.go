@@ -131,8 +131,10 @@ type ETHTestServer struct {
 
 	beacon *catalyst.SimulatedBeacon
 
-	// New field: stats for tracking mining statistics
 	stats ETHTestServerStats
+
+	cancelFunc context.CancelFunc
+	wg         sync.WaitGroup
 }
 
 // NewETHTestServer creates a new Ethereum test server with the given configuration.
@@ -428,10 +430,17 @@ func (s *ETHTestServer) Run(ctx context.Context) error {
 		return fmt.Errorf("ETHTestServer: failed to start Geth node: %w", err)
 	}
 
+	// Wrap the incoming context with a cancellation function for internal use.
+	ctx, cancel := context.WithCancel(ctx)
+	s.cancelFunc = cancel
+
 	// Record the mining start time.
 	s.startTime = time.Now()
 
+	// Launch the auto-mining goroutine.
+	s.wg.Add(1)
 	go func() {
+		defer s.wg.Done()
 		if !s.config.AutoMining {
 			slog.Info("AutoMining is disabled; skipping block generation")
 			return
@@ -513,6 +522,25 @@ func (s *ETHTestServer) Stop(ctx context.Context) error {
 		return fmt.Errorf("ETHTestServer: server is not running")
 	}
 	defer s.running.Store(false)
+
+	// Cancel any background operations and wait for them to finish.
+	if s.cancelFunc != nil {
+		s.cancelFunc()
+		s.cancelFunc = nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// ok
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
 	var errs []error
 

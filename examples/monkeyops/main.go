@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"log/slog"
 	"math/big"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/0xsequence/ethkit/ethartifact"
@@ -89,11 +92,19 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// trap SIGINT and SIGTERM
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		slog.Info("Received shutdown signal, initiating graceful shutdown...")
+		cancel()
+	}()
+
 	err = server.Run(ctx)
 	if err != nil {
 		log.Fatalf("Failed to run test server: %v", err)
 	}
-	defer server.Stop(ctx)
 
 	slog.Info("ETH Test server started successfully", "endpoint", server.HTTPEndpoint())
 	go printStatus(ctx, server)
@@ -151,9 +162,11 @@ func main() {
 
 	err = server.Stop(ctx)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		slog.Error("Failed to stop test server", "error", err)
 		os.Exit(1)
-		return
 	}
 }
 
