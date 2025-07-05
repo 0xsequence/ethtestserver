@@ -31,7 +31,8 @@ func main() {
 		runERC20   = flag.Bool("run-erc20", false, "Run monkey transferors for ERC20 transactions")
 		runERC721  = flag.Bool("run-erc721", false, "Run monkey transferors for ERC721 transactions")
 
-		runAll = flag.Bool("run-all", false, "Run all monkey transferors (native, ERC20, ERC721, ERC1155)")
+		runAll   = flag.Bool("run-all", false, "Run all monkey transferors (native, ERC20, ERC721, ERC1155)")
+		autoMine = flag.Bool("auto-mine", false, "Enable automatic mining of new blocks")
 	)
 	flag.Parse()
 
@@ -65,7 +66,7 @@ func main() {
 	}
 
 	config := &ethtestserver.ETHTestServerConfig{
-		AutoMining:     true,
+		AutoMining:     *autoMine, // Use the autoMine flag to enable or disable automatic mining
 		HTTPHost:       "localhost",
 		HTTPPort:       8545,
 		InitialSigners: knownWallets,
