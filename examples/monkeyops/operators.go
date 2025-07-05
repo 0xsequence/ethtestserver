@@ -16,6 +16,8 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
+const gasLimit = 300_000
+
 var monkeyOperatorConfig = monkey.MonkeyOperatorConfig{
 	TickerInterval:          1 * time.Millisecond,
 	MinTransactionsPerBlock: 30,
@@ -58,7 +60,7 @@ func (n *nativeTransactionGenerator) GenerateTransaction(ctx context.Context, ge
 			nonce,
 			recipient.Address(),
 			amount,
-			300_000,
+			gasLimit,
 			gen.BaseFee(),
 			nil,
 		),
@@ -187,7 +189,7 @@ func (g *ERC1155TransactionGenerator) GenerateTransaction(ctx context.Context, g
 		nonce,
 		common.Address(g.erc1155Caller.Address),
 		nil,
-		300_000,
+		gasLimit,
 		gen.BaseFee(),
 		calldata,
 	)
@@ -299,7 +301,7 @@ func (g *ERC20TransactionGenerator) GenerateTransaction(ctx context.Context, gen
 		nonce,
 		common.Address(g.erc20Caller.Address),
 		nil,
-		300_000,
+		gasLimit,
 		gen.BaseFee(),
 		calldata,
 	)
@@ -434,7 +436,7 @@ func (g *ERC721TransactionGenerator) GenerateTransaction(ctx context.Context, ge
 		nonce,
 		common.Address(g.erc721Caller.Address),
 		nil,
-		300_000,
+		gasLimit,
 		gen.BaseFee(),
 		calldata,
 	)
