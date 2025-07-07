@@ -92,7 +92,6 @@ type ETHTestServerConfig struct {
 
 	InitialSigners   []*Signer                   // Initial signers for the test server
 	InitialBalances  map[common.Address]*big.Int // Initial account balances
-	InitialContracts map[common.Address][]byte   // Deployed contracts (bytecode only)
 	InitialBlockNum  uint64                      // Initial block number
 	InitialTimestamp uint64                      // Initial timestamp
 
