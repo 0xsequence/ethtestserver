@@ -9,14 +9,17 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"math/rand"
 	"os"
 	"path"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/0xsequence/ethkit/ethartifact"
 	"github.com/0xsequence/ethkit/go-ethereum/accounts/abi"
 
+	"github.com/0xsequence/runnable"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/beacon"
@@ -44,56 +47,58 @@ import (
 )
 
 const (
-	chainDataDir = "chaindata" // Default directory for chain data
+	defaultDataDir = "data"
 
-	storeDataDir = "ethtestserver.state" // Default directory for the test server data
+	chainDataDir = "chain" // Directory for chain data
+	storeDataDir = "state" // Directory for the test server state
 )
 
+const (
+	dbModeMemory = "memory"
+	dbModeDisk   = "disk"
+)
+
+var (
+	defaultLogLevel = slog.LevelDebug
+)
+
+// ETHContractCaller represents a deployed contract.
 type ETHContractCaller struct {
 	Address common.Address // Address of the contract
 	ABI     abi.ABI
 }
 
-type ETHTestServer struct {
-	mu sync.Mutex
-
-	config    ETHTestServerConfig
-	stateDB   *cockroachdbpebble.DB // State database for the test server
-	stateDBMu sync.Mutex            // Mutex to protect stateDB access
-
-	initialized bool      // Whether the server has been initialized
-	startTime   time.Time // Time when the server started mining
-
-	node      *node.Node
-	ethereum  *eth.Ethereum
-	artifacts *ethartifact.ContractRegistry // Registry of JSON artifacts for the test server
-
-	engine consensus.Engine // Consensus engine used by the test server
-	db     ethdb.Database   // Database used by the test server
-
-	beacon *catalyst.SimulatedBeacon
+// ETHTestServerStats contains statistics about mining activity.
+type ETHTestServerStats struct {
+	BlocksMined      uint64        // Total number of blocks mined
+	TxCount          uint64        // Total number of transactions processed
+	CurrentBlock     uint64        // Current block number
+	CurrentBlockHash common.Hash   // Hash of the current block
+	BlocksPerSecond  float64       // number of blocks mined per second
+	ElapsedTime      time.Duration // Total elapsed time since mining started
 }
 
+// ETHTestServerConfig represents the configuration for ETHTestServer.
 type ETHTestServerConfig struct {
 	AutoMining bool          // Whether to enable mining on the test server
 	MineRate   time.Duration // How often to mine a new block
 
-	MaxBlockNum uint64        // Maximum block number for the test server, defaults to unlimited
-	MaxDuration time.Duration // Maximum duration to run mining, defaults to unlimited
+	MaxBlockNum uint64        // Maximum block number for the test server (if nonzero)
+	MaxDuration time.Duration // Maximum mining duration (if nonzero)
 
 	ChainID *big.Int // Chain ID for the test server
-	DataDir string   // Directory to store the blockchain data
-	DBMode  string   // Database mode for the test server (e.g., "memory", "disk")
+	DataDir string   // Directory to store persistent data (chain data, state, genesis)
+	DBMode  string   // Database mode ("memory" or "disk")
 
 	InitialSigners   []*Signer                   // Initial signers for the test server
-	InitialBalances  map[common.Address]*big.Int // Initial account balances for the test server
-	InitialContracts map[common.Address][]byte   // Deployed bytecode-only contracts
-	InitialBlockNum  uint64                      // Initial block number for the test server
-	InitialTimestamp uint64                      // Initial timestamp for the test server
+	InitialBalances  map[common.Address]*big.Int // Initial account balances
+	InitialContracts map[common.Address][]byte   // Deployed contracts (bytecode only)
+	InitialBlockNum  uint64                      // Initial block number
+	InitialTimestamp uint64                      // Initial timestamp
 
 	ReorgProbability float64 // Probability of a reorg occurring during mining
-	ReorgDepthMin    int     // Minimum depth of a reorg to trigger
-	ReorgDepthMax    int     // Maximum depth of a reorg to trigger
+	ReorgDepthMin    int     // Minimum reorg depth
+	ReorgDepthMax    int     // Maximum reorg depth
 
 	Genesis       *core.Genesis     // Base genesis block for the test server
 	NodeConfig    *node.Config      // Base configuration for the Geth node
@@ -102,47 +107,131 @@ type ETHTestServerConfig struct {
 	HTTPHost string // Host to bind the HTTP RPC server to
 	HTTPPort int    // Port to bind the HTTP RPC server to
 
-	// Load artifacts into the test server registry
-	Artifacts []ethartifact.Artifact
+	Artifacts []ethartifact.Artifact // JSON artifacts to load into the registry
+}
+
+// ETHTestServer contains the test server state and configuration.
+type ETHTestServer struct {
+	mu      sync.Mutex
+	running atomic.Bool // Indicates if the server is currently running
+
+	config    *ETHTestServerConfig
+	stateDB   *cockroachdbpebble.DB // State database for the test server
+	stateDBMu sync.Mutex            // Mutex to protect stateDB access
+
+	initialized bool      // Whether the server has been initialized
+	startTime   time.Time // Time when mining started
+
+	node      *node.Node
+	ethereum  *eth.Ethereum
+	artifacts *ethartifact.ContractRegistry // Registry of JSON artifacts
+
+	engine consensus.Engine // Consensus engine used by the test server
+	db     ethdb.Database   // Database used by the test server
+
+	beacon *catalyst.SimulatedBeacon
+
+	stats ETHTestServerStats
+
+	cancelFunc context.CancelFunc
+	wg         sync.WaitGroup
 }
 
 // NewETHTestServer creates a new Ethereum test server with the given configuration.
 func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
-	s := &ETHTestServer{}
-
-	var err error
-	s.stateDB, err = cockroachdbpebble.Open(storeDataDir, &cockroachdbpebble.Options{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create state store: %w", err)
-	}
-
 	if config == nil {
 		config = &ETHTestServerConfig{}
 	}
 
-	initialized := false
-	if config.DBMode != "memory" && config.DataDir == "" {
-		config.DataDir = "ethereum" // Default data directory
+	s := &ETHTestServer{
+		config: config,
 	}
 
-	if config.DBMode == "memory" {
-		config.DataDir = ""
-	} else {
-		dataDirStat, err := os.Stat(config.DataDir)
-		if err == nil && !dataDirStat.IsDir() {
-			return nil, fmt.Errorf("data directory %s exists but is not a directory", config.DataDir)
+	// Default to disk mode if not specified or if the mode is invalid.
+	if config.DBMode != dbModeMemory && config.DBMode != dbModeDisk {
+		config.DBMode = dbModeDisk
+	}
+
+	if config.DataDir == "" {
+		config.DataDir = defaultDataDir
+	}
+
+	// Ensure the data directory exists.
+	if config.DBMode == dbModeDisk {
+		if err := os.MkdirAll(config.DataDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create data directory %s: %w", config.DataDir, err)
 		}
-
-		initialized = dataDirStat != nil && dataDirStat.IsDir()
 	}
 
+	var err error
+	s.stateDB, err = cockroachdbpebble.Open(
+		s.resolvePath(storeDataDir),
+		&cockroachdbpebble.Options{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create state store: %w", err)
+	}
+
+	// Validate configuration (e.g. reorg parameters).
+	if config.ReorgProbability < 0 || config.ReorgProbability > 1 {
+		return nil, fmt.Errorf("ReorgProbability must be between 0 and 1, got %f", config.ReorgProbability)
+	}
+
+	if config.ReorgProbability > 0 {
+		if config.ReorgDepthMin <= 0 {
+			return nil, fmt.Errorf("ReorgDepthMin must be >0 when ReorgProbability > 0, got %d", config.ReorgDepthMin)
+		}
+		if config.ReorgDepthMax < config.ReorgDepthMin {
+			return nil, fmt.Errorf("ReorgDepthMax (got %d) must be >= ReorgDepthMin (%d)", config.ReorgDepthMax, config.ReorgDepthMin)
+		}
+	}
+
+	// Set a default mine rate.
 	if config.MineRate == 0 {
-		config.MineRate = 1 * time.Second // Default mine rate
+		config.MineRate = 1 * time.Second
 	}
 
-	var genesisPath string
-	if config.DataDir != "" {
-		genesisPath = path.Join(config.DataDir, "genesis.json")
+	if config.HTTPHost == "" {
+		config.HTTPHost = "127.0.0.1"
+	}
+	if config.HTTPPort == 0 {
+		config.HTTPPort = 0
+	}
+	if config.NodeConfig == nil {
+		config.NodeConfig = &node.Config{}
+	}
+
+	// Override node config with custom values.
+	config.NodeConfig.Name = "main"
+	config.NodeConfig.DataDir = s.resolvePath(chainDataDir)
+	config.NodeConfig.HTTPHost = config.HTTPHost
+	config.NodeConfig.HTTPPort = config.HTTPPort
+	config.NodeConfig.HTTPModules = []string{"eth", "net", "web3", "txpool"}
+	config.NodeConfig.Logger = log.NewLogger(
+		slog.NewJSONHandler(
+			os.Stdout,
+			&slog.HandlerOptions{
+				Level: defaultLogLevel,
+			},
+		),
+	)
+
+	if config.ServiceConfig == nil {
+		config.ServiceConfig = &ethconfig.Defaults
+	}
+
+	// Initialization steps: check if genesis has been created.
+	initialized := false
+	genesisPath := s.resolvePath("genesis.json")
+
+	if config.DBMode == dbModeDisk {
+		genesisStat, err := os.Stat(genesisPath)
+		if err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("failed to check genesis config file %s: %w", genesisPath, err)
+		}
+		if err == nil && genesisStat.Size() > 0 {
+			initialized = true
+		}
 	}
 
 	if initialized {
@@ -150,7 +239,6 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to read genesis config from %s: %w", genesisPath, err)
 		}
-
 		if err := json.Unmarshal(buf, &config.Genesis); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal genesis config from %s: %w", genesisPath, err)
 		}
@@ -158,22 +246,17 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		if config.Genesis == nil {
 			config.Genesis = &core.Genesis{}
 		}
-
-		// override genesis config with custom values
 		if config.Genesis.Config == nil {
 			config.Genesis.Config = params.AllDevChainProtocolChanges
 		}
-
 		if config.Genesis.GasLimit == 0 {
 			config.Genesis.GasLimit = 5_000_000
 		}
-
 		if config.Genesis.BaseFee == nil {
 			config.Genesis.BaseFee = big.NewInt(params.InitialBaseFee)
 		}
-
 		if config.Genesis.Difficulty == nil {
-			config.Genesis.Difficulty = common.Big1 // Default difficulty for the genesis block
+			config.Genesis.Difficulty = common.Big1
 		}
 
 		config.Genesis.Alloc = make(types.GenesisAlloc)
@@ -181,7 +264,7 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 			addr := signer.Address()
 			balance, ok := config.InitialBalances[addr]
 			if !ok {
-				continue // Skip if no balance is set for this address
+				continue
 			}
 			config.Genesis.Alloc[addr] = types.Account{
 				Balance: balance,
@@ -190,12 +273,8 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 
 		config.Genesis.Timestamp = config.InitialTimestamp
 
-		// persist genesis config to disk
-		if config.DataDir != "" {
-			if err := os.MkdirAll(config.DataDir, 0755); err != nil {
-				return nil, fmt.Errorf("failed to create data directory %s: %w", config.DataDir, err)
-			}
-
+		// Persist genesis config to disk.
+		if config.DBMode == dbModeDisk {
 			buf, err := json.MarshalIndent(config.Genesis, "", "  ")
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal genesis config: %w", err)
@@ -206,108 +285,62 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		}
 	}
 
-	if config.HTTPHost == "" {
-		config.HTTPHost = "127.0.0.1"
-	}
-
-	if config.HTTPPort == 0 {
-		config.HTTPPort = 0
-	}
-
-	if config.NodeConfig == nil {
-		config.NodeConfig = &node.Config{}
-	}
-
-	// override node config with custom values
-	config.NodeConfig.Name = "ethtestserver"
-	config.NodeConfig.HTTPHost = config.HTTPHost
-	config.NodeConfig.HTTPPort = config.HTTPPort
-	config.NodeConfig.HTTPModules = []string{"eth", "net", "web3", "txpool"}
-	config.NodeConfig.Logger = log.NewLogger(
-		slog.NewJSONHandler(
-			os.Stdout,
-			&slog.HandlerOptions{Level: slog.LevelDebug},
-		),
-	)
-	config.NodeConfig.DataDir = config.DataDir
-
 	stack, err := node.New(config.NodeConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Geth node: %w", err)
 	}
 
-	if config.ServiceConfig == nil {
-		config.ServiceConfig = &ethconfig.Defaults
-	}
-
-	// override service config with custom values
+	// Override service config.
 	config.ServiceConfig.Genesis = config.Genesis
 	config.ServiceConfig.SyncMode = ethconfig.FullSync
 	config.ServiceConfig.HistoryMode = history.KeepAll
 	config.ServiceConfig.FilterLogCacheSize = 1000
 
 	if !initialized {
-		db, err := openDatabase(config, stack, false)
+		db, err := s.openDatabase(stack, false)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open chain database: %w", err)
 		}
 
 		triedb := triedb.NewDatabase(db, triedb.HashDefaults)
-
 		_ = config.Genesis.MustCommit(db, triedb)
 
 		if err := triedb.Close(); err != nil {
 			return nil, fmt.Errorf("failed to close trie database: %w", err)
 		}
-
 		if err := db.Close(); err != nil {
 			return nil, fmt.Errorf("failed to close database: %w", err)
 		}
 	}
 
-	// initialize the main service
 	service, err := eth.New(stack, config.ServiceConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to register Ethereum service: %w", err)
 	}
 
-	// enable the regular APIs
+	// Enable APIs.
 	stack.RegisterAPIs(tracers.APIs(service.APIBackend))
 
-	// enable the logs API
-	filterSystem := filters.NewFilterSystem(
-		service.APIBackend,
-		filters.Config{},
-	)
-
-	// register the filter API
+	filterSystem := filters.NewFilterSystem(service.APIBackend, filters.Config{})
 	stack.RegisterAPIs([]rpc.API{{
 		Namespace: "eth",
-		Service: filters.NewFilterAPI(
-			filterSystem,
-		),
+		Service:   filters.NewFilterAPI(filterSystem),
 	}})
 
-	// set up simulated beacon
-	simBeacon, err := catalyst.NewSimulatedBeacon(
-		0,
-		common.Address{},
-		service,
-	)
+	// Set up simulated beacon.
+	simBeacon, err := catalyst.NewSimulatedBeacon(0, common.Address{}, service)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create simulated beacon: %w", err)
 	}
 
-	// Set the initial fork for the simulated beacon
 	bc := service.BlockChain()
 	latestBlockHeader := bc.CurrentBlock()
 	if err := simBeacon.Fork(latestBlockHeader.Hash()); err != nil {
 		return nil, fmt.Errorf("failed to set beacon fork: %w", err)
 	}
 
-	engine := beacon.New(ethash.NewFaker()) // Use a fake ethash engine for testing
+	engine := beacon.New(ethash.NewFaker())
 
-	s.config = *config
 	s.node = stack
 	s.ethereum = service
 	s.beacon = simBeacon
@@ -316,7 +349,7 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	s.db = service.ChainDb()
 	s.artifacts = ethartifact.NewContractRegistry()
 
-	// load artifacts into registry
+	// Load artifacts.
 	if len(config.Artifacts) > 0 {
 		for _, artifact := range config.Artifacts {
 			if err := s.artifacts.Add(artifact); err != nil {
@@ -328,50 +361,101 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	return s, nil
 }
 
+func (s *ETHTestServer) updateStatsAfterBlockGen(blocks ...*types.Block) {
+	if len(blocks) == 0 {
+		return
+	}
+
+	latestBlock := blocks[len(blocks)-1]
+
+	for _, block := range blocks {
+		s.stats.BlocksMined++
+		s.stats.TxCount += uint64(len(block.Transactions()))
+	}
+
+	s.stats.CurrentBlock = latestBlock.Number().Uint64()
+	s.stats.CurrentBlockHash = latestBlock.Hash()
+
+	if s.startTime.IsZero() {
+		s.stats.ElapsedTime = 0
+		s.stats.BlocksPerSecond = 0
+	} else {
+		s.stats.ElapsedTime = time.Since(s.startTime)
+		s.stats.BlocksPerSecond = float64(s.stats.BlocksMined) / s.stats.ElapsedTime.Seconds()
+	}
+}
+
+// Stats returns a snapshot of the current mining statistics.
+func (s *ETHTestServer) Stats() ETHTestServerStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stats
+}
+
+func (s *ETHTestServer) IsRunning() bool {
+	if s == nil {
+		return false
+	}
+
+	return s.running.Load()
+}
+
 func (s *ETHTestServer) Run(ctx context.Context) error {
+	if s == nil {
+		return fmt.Errorf("ETHTestServer: nil server instance")
+	}
+
+	if s.running.Load() {
+		return fmt.Errorf("ETHTestServer: server is already running")
+	}
+	s.running.Store(true)
+
 	if s.node == nil {
-		return fmt.Errorf("ETHTestServer: node is not initialized")
+		return fmt.Errorf("ETHTestServer: node not initialized")
 	}
 
 	if s.ethereum == nil {
-		return fmt.Errorf("ETHTestServer: ethereum service is not initialized")
+		return fmt.Errorf("ETHTestServer: ethereum service not initialized")
 	}
 
 	if !s.initialized {
-		// add first empty block to initialize the blockchain
-		if _, _, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) {}); err != nil {
+		// Generate the first empty block to initialize the chain.
+		if _, _, err := s.GenerateBlocks(1, nil); err != nil {
 			return fmt.Errorf("ETHTestServer: failed to generate initial block: %w", err)
 		}
 	}
 
-	// Start HTTP server
 	err := s.node.Start()
 	if err != nil {
 		return fmt.Errorf("ETHTestServer: failed to start Geth node: %w", err)
 	}
 
-	// Record the start time for mining duration tracking
+	// Wrap the incoming context with a cancellation function for internal use.
+	ctx, cancel := context.WithCancel(ctx)
+	s.cancelFunc = cancel
+
+	// Record the mining start time.
 	s.startTime = time.Now()
 
+	// Launch the auto-mining goroutine.
+	s.wg.Add(1)
 	go func() {
+		defer s.wg.Done()
 		if !s.config.AutoMining {
-			slog.Info("AutoMining is disabled, skipping block generation")
+			slog.Info("AutoMining is disabled; skipping block generation")
 			return
 		}
 
 		ticker := time.NewTicker(s.config.MineRate)
 		defer ticker.Stop()
 
-		// Create a timeout timer if MaxDuration is set
 		var timeoutTimer *time.Timer
 		var timeoutChan <-chan time.Time
 		if s.config.MaxDuration > 0 {
 			timeoutTimer = time.NewTimer(s.config.MaxDuration)
 			timeoutChan = timeoutTimer.C
 			defer timeoutTimer.Stop()
-
-			slog.Info("Mining will stop after duration",
-				"maxDuration", s.config.MaxDuration,
+			slog.Info("Mining will stop after max duration", "maxDuration", s.config.MaxDuration,
 				"stopTime", s.startTime.Add(s.config.MaxDuration).Format(time.RFC3339))
 		}
 
@@ -380,17 +464,20 @@ func (s *ETHTestServer) Run(ctx context.Context) error {
 			case <-ctx.Done():
 				slog.Info("Stopping mining due to context cancellation")
 				return
+
 			case <-timeoutChan:
 				elapsed := time.Since(s.startTime)
-				slog.Info("Stopping mining due to maximum duration reached",
-					"maxDuration", s.config.MaxDuration,
-					"elapsed", elapsed)
+				slog.Info("Stopping mining: maximum duration reached", "maxDuration", s.config.MaxDuration, "elapsed", elapsed)
 				return
+
 			case <-ticker.C:
 				err := s.mineBlock()
 				if err != nil {
-					slog.Error("Failed to mine block, stopping mining", "error", err)
-					return
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						slog.Info("Stopping mining due to context error", "error", err)
+						return
+					}
+					slog.Warn("Failed to mine a block; will retry", "error", err)
 				}
 			}
 		}
@@ -399,81 +486,90 @@ func (s *ETHTestServer) Run(ctx context.Context) error {
 	return nil
 }
 
-func (s *ETHTestServer) MiningStats() map[string]interface{} {
+// simulateFork simulates a blockchain fork at the given block number.
+func (s *ETHTestServer) simulateFork(blockNumber int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if blockNumber < 0 {
+		return fmt.Errorf("blockNumber must be non-negative, got %d", blockNumber)
+	}
+
 	bc := s.ethereum.BlockChain()
-	currentBlock := bc.CurrentBlock().Number.Uint64()
+	beforeFork := bc.CurrentBlock()
+	slog.Info("Simulating fork", "currentBlockNumber", beforeFork.Number.Uint64(), "currentBlockHash", beforeFork.Hash().Hex())
 
-	status := map[string]interface{}{
-		"autoMining":   s.config.AutoMining,
-		"currentBlock": currentBlock,
-		"maxBlockNum":  s.config.MaxBlockNum,
-		"maxDuration":  s.config.MaxDuration,
-		"mineRate":     s.config.MineRate,
+	blockHash := bc.GetCanonicalHash(uint64(blockNumber))
+	if err := s.beacon.Fork(blockHash); err != nil {
+		return fmt.Errorf("failed to fork simulated beacon: %w", err)
 	}
 
-	if !s.startTime.IsZero() {
-		elapsed := time.Since(s.startTime)
-		status["startTime"] = s.startTime.Format(time.RFC3339)
-		status["elapsed"] = elapsed
-
-		if s.config.MaxDuration > 0 {
-			remaining := s.config.MaxDuration - elapsed
-			if remaining < 0 {
-				remaining = 0
-			}
-			status["remainingTime"] = remaining
-			status["timeExpired"] = elapsed >= s.config.MaxDuration
-		}
-
-		if s.config.MaxBlockNum > 0 {
-			status["blockLimitReached"] = currentBlock >= s.config.MaxBlockNum
-		}
-	}
-
-	return status
-}
-
-func (s *ETHTestServer) Commit() common.Hash {
-	return s.beacon.Commit()
-}
-
-func (s *ETHTestServer) Fork(parentHash common.Hash) error {
-	return s.beacon.Fork(parentHash)
-}
-
-func (s *ETHTestServer) Rollback() {
 	s.beacon.Rollback()
+	s.beacon.Commit()
+
+	afterFork := bc.CurrentBlock()
+	slog.Info("Fork simulated successfully", "newBlockNumber", afterFork.Number.Uint64(), "newBlockHash", afterFork.Hash().Hex())
+
+	return nil
 }
 
 func (s *ETHTestServer) Stop(ctx context.Context) error {
+	if s == nil {
+		return fmt.Errorf("ETHTestServer: nil server instance")
+	}
+
+	if !s.running.Load() {
+		return fmt.Errorf("ETHTestServer: server is not running")
+	}
+	defer s.running.Store(false)
+
+	// Cancel any background operations and wait for them to finish.
+	if s.cancelFunc != nil {
+		s.cancelFunc()
+		s.cancelFunc = nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// ok
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	var errs []error
+
 	s.stateDBMu.Lock()
 	if s.stateDB != nil {
 		if err := s.stateDB.Close(); err != nil {
-			slog.Error("Failed to close state database", "error", err)
+			errs = append(errs, fmt.Errorf("failed to close state database: %w", err))
 		}
 		s.stateDB = nil
 	}
 	s.stateDBMu.Unlock()
 
-	if s.node != nil {
-		err := s.node.Close()
-		if err != nil {
-			slog.Error("Failed to close Geth node", "error", err)
-		}
-		s.node = nil
-	}
-
 	if s.beacon != nil {
-		err := s.beacon.Stop()
-		if err != nil {
-			slog.Error("Failed to stop simulated beacon", "error", err)
+		if err := s.beacon.Stop(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to stop simulated beacon: %w", err))
 		}
 		s.beacon = nil
 	}
 
+	if s.node != nil {
+		if err := s.node.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close Geth node: %w", err))
+		}
+		s.node = nil
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("errors during shutdown: %v", errs)
+	}
 	return nil
 }
 
@@ -502,7 +598,6 @@ func (s *ETHTestServer) RetrieveValue(key string, value interface{}) (bool, erro
 	}
 
 	if value == nil {
-		// no value provided, just checking if the key exists
 		return true, nil
 	}
 
@@ -562,21 +657,24 @@ func (s *ETHTestServer) DeleteValue(key string) error {
 	return nil
 }
 
-func (s *ETHTestServer) GenBlocks(n int, gen func(int, *core.BlockGen)) ([]*types.Block, []types.Receipts, error) {
+// GenerateBlocks generates n blocks using the provided block generation function.
+func (s *ETHTestServer) GenerateBlocks(n int, blockGenFn func(int, *core.BlockGen) error) ([]*types.Block, []types.Receipts, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	bc := s.ethereum.BlockChain()
+	if n <= 0 {
+		return nil, nil, fmt.Errorf("ETHTestServer: number of blocks to generate must be > 0")
+	}
 
+	bc := s.ethereum.BlockChain()
 	latestBlockHeader := bc.CurrentBlock()
 	latestBlock := bc.GetBlock(latestBlockHeader.Hash(), latestBlockHeader.Number.Uint64())
 
-	// Check block number limit
+	// Check limits.
 	if latestBlock.Number().Uint64() >= s.config.MaxBlockNum && s.config.MaxBlockNum > 0 {
 		return nil, nil, fmt.Errorf("ETHTestServer: reached maximum block number %d", s.config.MaxBlockNum)
 	}
 
-	// Check time limit
 	if s.config.MaxDuration > 0 && !s.startTime.IsZero() {
 		elapsed := time.Since(s.startTime)
 		if elapsed >= s.config.MaxDuration {
@@ -584,14 +682,26 @@ func (s *ETHTestServer) GenBlocks(n int, gen func(int, *core.BlockGen)) ([]*type
 		}
 	}
 
+	var genErr error
 	blocks, receipts := core.GenerateChain(
 		s.config.Genesis.Config,
 		latestBlock,
 		s.engine,
 		s.db,
 		n,
-		gen,
+		func(i int, gen *core.BlockGen) {
+			if blockGenFn == nil || genErr != nil {
+				return
+			}
+			if err := blockGenFn(i, gen); err != nil {
+				genErr = fmt.Errorf("block generation failed: %w", err)
+			}
+		},
 	)
+
+	if genErr != nil {
+		return nil, nil, fmt.Errorf("ETHTestServer: block generation error: %w", genErr)
+	}
 
 	_, err := bc.InsertChain(blocks)
 	if err != nil {
@@ -602,6 +712,8 @@ func (s *ETHTestServer) GenBlocks(n int, gen func(int, *core.BlockGen)) ([]*type
 		return nil, nil, fmt.Errorf("ETHTestServer: failed to wait for transaction indexing: %w", err)
 	}
 
+	s.updateStatsAfterBlockGen(blocks...)
+
 	return blocks, receipts, nil
 }
 
@@ -609,10 +721,10 @@ func (s *ETHTestServer) HTTPEndpoint() string {
 	if s.node == nil {
 		return ""
 	}
-
 	return s.node.HTTPEndpoint()
 }
 
+// DeployContract deploys a contract using the given signer and returns a caller.
 func (s *ETHTestServer) DeployContract(signer *Signer, contractName string, constructorArgs ...interface{}) (*ETHContractCaller, error) {
 	artifact, ok := s.artifacts.Get(contractName)
 	if !ok {
@@ -635,24 +747,23 @@ func (s *ETHTestServer) DeployContract(signer *Signer, contractName string, cons
 
 	calldata = append(calldata, input...)
 
-	_, receipts, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) {
+	_, receipts, err := s.GenerateBlocks(1, func(i int, gen *core.BlockGen) error {
 		nonce := gen.TxNonce(signer.Address())
-
 		tx := types.NewContractCreation(
 			nonce,
 			new(big.Int),
 			3_000_000, // Gas limit
 			gen.BaseFee(),
-			calldata, // Contract bytecode and constructor calldata
+			calldata,
 		)
 
 		signedTxn, err := types.SignTx(tx, gen.Signer(), signer.RawPrivateKey())
 		if err != nil {
-			slog.Error("DeployContract: Failed to sign transaction", "error", err)
-			return
+			return fmt.Errorf("failed to sign transaction: %w", err)
 		}
 
 		gen.AddTx(signedTxn)
+		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate block for contract deployment: %w", err)
@@ -663,11 +774,9 @@ func (s *ETHTestServer) DeployContract(signer *Signer, contractName string, cons
 	}
 
 	receipt := receipts[0][0]
-
 	if receipt.Status != types.ReceiptStatusSuccessful {
 		return nil, fmt.Errorf("contract deployment failed with status: %d", receipt.Status)
 	}
-
 	if receipt.ContractAddress == (common.Address{}) {
 		return nil, fmt.Errorf("contract deployment failed, address is empty")
 	}
@@ -678,11 +787,11 @@ func (s *ETHTestServer) DeployContract(signer *Signer, contractName string, cons
 	}, nil
 }
 
+// ContractTransact calls a contract method using the given signer.
 func (s *ETHTestServer) ContractTransact(signer *Signer, contract *ETHContractCaller, methodName string, methodArgs ...interface{}) error {
 	if signer == nil {
 		return fmt.Errorf("signer cannot be nil")
 	}
-
 	if contract == nil {
 		return fmt.Errorf("contract cannot be nil")
 	}
@@ -692,25 +801,24 @@ func (s *ETHTestServer) ContractTransact(signer *Signer, contract *ETHContractCa
 		return fmt.Errorf("failed to pack contract method call: %w", err)
 	}
 
-	_, receipts, err := s.GenBlocks(1, func(i int, gen *core.BlockGen) {
+	_, receipts, err := s.GenerateBlocks(1, func(i int, gen *core.BlockGen) error {
 		nonce := gen.TxNonce(signer.Address())
-
 		tx := types.NewTransaction(
 			nonce,
 			common.Address(contract.Address),
 			nil, // value
 			300_000,
 			gen.BaseFee(),
-			calldata, // data
+			calldata,
 		)
 
 		signedTxn, err := types.SignTx(tx, gen.Signer(), signer.RawPrivateKey())
 		if err != nil {
-			slog.Error("ContractTransact: Failed to sign transaction", "error", err)
-			return
+			return fmt.Errorf("failed to sign transaction: %w", err)
 		}
 
 		gen.AddTx(signedTxn)
+		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("failed to generate block for contract transaction: %w", err)
@@ -723,21 +831,24 @@ func (s *ETHTestServer) ContractTransact(signer *Signer, contract *ETHContractCa
 	return nil
 }
 
+// PrintStatus logs the current status using our stats.
 func (s *ETHTestServer) PrintStatus() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	bc := s.ethereum.BlockChain()
-	currentBlock := bc.CurrentBlock().Number.Uint64()
+	stats := s.stats
 
 	logFields := []interface{}{
-		"latestBlock", currentBlock,
-		"latestBlockHash", bc.CurrentBlock().Hash().Hex(),
+		"currentBlock", stats.CurrentBlock,
+		"blocksMined", stats.BlocksMined,
+		"txCount", stats.TxCount,
+		"blocksPerSecond", fmt.Sprintf("%.2f", stats.BlocksPerSecond),
+		"elapsedTime", stats.ElapsedTime,
 	}
 
 	if s.config.MaxBlockNum > 0 {
 		logFields = append(logFields, "maxBlockNum", s.config.MaxBlockNum)
-		logFields = append(logFields, "blocksRemaining", s.config.MaxBlockNum-currentBlock)
+		logFields = append(logFields, "blocksRemaining", s.config.MaxBlockNum-stats.CurrentBlock)
 	}
 
 	if s.config.MaxDuration > 0 && !s.startTime.IsZero() {
@@ -754,67 +865,93 @@ func (s *ETHTestServer) PrintStatus() {
 	slog.Info("ETHTestServer Status", logFields...)
 }
 
-// Mine triggers a block mining operation that will include all pending
-// transactions in the transaction pool.
+// Mine triggers a block mining operation.
 func (s *ETHTestServer) Mine() error {
 	return s.mineBlock()
 }
 
+// mineBlock generates one block (using GenerateBlocks), optionally simulates a fork,
+// and then updates the stats.
 func (s *ETHTestServer) mineBlock() error {
-	_, _, err := s.GenBlocks(1, func(i int, block *core.BlockGen) {
+	_, _, err := s.GenerateBlocks(1, func(i int, gen *core.BlockGen) error {
 		latestBlockHeader := s.ethereum.BlockChain().CurrentBlock()
-
 		txPool := s.ethereum.TxPool()
 		pending := txPool.Pending(txpool.PendingFilter{})
-
-		var gasUsed uint64 = 0
-
+		var gasUsed uint64
 		blockGasLimit := latestBlockHeader.GasLimit
 
-		// Choose as many transactions as possible without exceeding the parent's gas limit.
 		var selectedTxs types.Transactions
 		for _, batch := range pending {
 			for _, lazy := range batch {
 				if tx := lazy.Resolve(); tx != nil {
-					txGas := tx.Gas()
-					if gasUsed+txGas <= blockGasLimit {
+					if gasUsed+tx.Gas() <= blockGasLimit {
 						selectedTxs = append(selectedTxs, tx)
-						gasUsed += txGas
+						gasUsed += tx.Gas()
 					}
 				}
 			}
 		}
 
-		if len(selectedTxs) == 0 {
-			//slog.Debug("No transactions selected for mining", "gasUsed", gasUsed, "blockGasLimit", blockGasLimit)
-			return
+		for _, tx := range selectedTxs {
+			gen.AddTx(tx)
 		}
 
-		for _, tx := range selectedTxs {
-			//slog.Debug("Adding transaction to block", "txHash", tx.Hash().Hex(), "gasUsed", tx.Gas(), "blockGasLimit", blockGasLimit)
-			block.AddTx(tx)
-		}
+		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("failed to generate block: %w", err)
 	}
 
+	// If reorg is enabled, try to simulate a fork.
+	if s.config.ReorgProbability > 0 && rand.Float64() < s.config.ReorgProbability {
+		bc := s.ethereum.BlockChain()
+		currentHeight := int(bc.CurrentBlock().Number.Uint64())
+		depthRange := s.config.ReorgDepthMax - s.config.ReorgDepthMin + 1
+
+		var depth int
+		if depthRange > 1 {
+			depth = rand.Intn(depthRange) + s.config.ReorgDepthMin
+		} else {
+			depth = s.config.ReorgDepthMin
+		}
+
+		if depth >= currentHeight {
+			depth = currentHeight - 1
+		}
+
+		if depth > 0 {
+			if err := s.simulateFork(currentHeight - depth); err != nil {
+				return fmt.Errorf("failed to simulate fork: %w", err)
+			}
+		} else {
+			slog.Info("Not enough blocks to simulate a fork", "chainHeight", currentHeight)
+		}
+	}
+
 	return nil
 }
 
+func (s *ETHTestServer) resolvePath(relPath ...string) string {
+	resolved := path.Join(s.config.DataDir, path.Join(relPath...))
+	log.Info("Resolved path", "path", resolved)
+	return resolved
+}
+
 func (s *ETHTestServer) waitForTxIndexing(ctx context.Context) error {
-	timeout := time.NewTimer(30 * time.Second)
+	timeout := time.NewTimer(5 * time.Second)
 	defer timeout.Stop()
 
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(2 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+
 		case <-timeout.C:
 			return fmt.Errorf("timeout waiting for transaction indexing")
+
 		case <-ticker.C:
 			progress, err := s.ethereum.BlockChain().TxIndexProgress()
 			if err == nil && progress.Done() {
@@ -824,22 +961,20 @@ func (s *ETHTestServer) waitForTxIndexing(ctx context.Context) error {
 	}
 }
 
-func makeKeyValueStore(config *ETHTestServerConfig, stack *node.Node, options *node.DatabaseOptions) (ethdb.KeyValueStore, error) {
+func (s *ETHTestServer) makeKeyValueStore(stack *node.Node, options *node.DatabaseOptions) (ethdb.KeyValueStore, error) {
 	if stack == nil {
 		return nil, fmt.Errorf("stack cannot be nil")
 	}
-
 	if options == nil {
 		return nil, fmt.Errorf("options cannot be nil")
 	}
 
-	if config.DBMode == "memory" || config.DataDir == "" {
-		// Use an in-memory database for testing, this database is always created
+	if s.config.DBMode == dbModeMemory {
 		return memorydb.New(), nil
 	}
 
 	kvdb, err := pebble.New(
-		stack.ResolvePath(chainDataDir),
+		stack.ResolvePath("chaindata"),
 		options.Cache,
 		options.Handles,
 		options.MetricsNamespace,
@@ -852,16 +987,15 @@ func makeKeyValueStore(config *ETHTestServerConfig, stack *node.Node, options *n
 	return kvdb, nil
 }
 
-func openDatabase(config *ETHTestServerConfig, stack *node.Node, readOnly bool) (ethdb.Database, error) {
+func (s *ETHTestServer) openDatabase(stack *node.Node, readOnly bool) (ethdb.Database, error) {
 	options := node.DatabaseOptions{
 		ReadOnly:          readOnly,
-		Cache:             128 * 1024 * 1024,
-		Handles:           128,
-		MetricsNamespace:  "eth/db/chaindata",
-		AncientsDirectory: stack.ResolveAncient(chainDataDir, ""),
+		Cache:             512,
+		Handles:           512,
+		AncientsDirectory: stack.ResolveAncient("chaindata", ""),
 	}
 
-	kvdb, err := makeKeyValueStore(config, stack, &options)
+	kvdb, err := s.makeKeyValueStore(stack, &options)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create key-value store: %w", err)
 	}
@@ -880,3 +1014,5 @@ func openDatabase(config *ETHTestServerConfig, stack *node.Node, readOnly bool) 
 
 	return db, nil
 }
+
+var _ runnable.Runnable = (*ETHTestServer)(nil)

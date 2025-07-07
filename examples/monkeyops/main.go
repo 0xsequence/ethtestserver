@@ -2,10 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"log"
 	"log/slog"
 	"math/big"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/0xsequence/ethkit/ethartifact"
@@ -21,6 +25,17 @@ var (
 )
 
 func main() {
+	var (
+		runNative  = flag.Bool("run-native", false, "Run monkey transferors for native ETH transactions")
+		runERC1155 = flag.Bool("run-erc1155", false, "Run monkey transferors for ERC1155 transactions")
+		runERC20   = flag.Bool("run-erc20", false, "Run monkey transferors for ERC20 transactions")
+		runERC721  = flag.Bool("run-erc721", false, "Run monkey transferors for ERC721 transactions")
+
+		runAll   = flag.Bool("run-all", false, "Run all monkey transferors (native, ERC20, ERC721, ERC1155)")
+		autoMine = flag.Bool("auto-mine", false, "Enable automatic mining of new blocks")
+	)
+	flag.Parse()
+
 	var (
 		wallet0 = ethtestserver.NewSignerWithKey("0x4a840bea3489bdebe9d90687b93e70e7b42341f96987382dd61fba2c6a976640") // 0x3c25c2353D0193625c868C4222C85592149E7f4B
 		wallet1 = ethtestserver.NewSignerWithKey("0x035378650c1b589ee7811302365d5ec734f85baf94c6ce105a594d65513811c2") // 0x0E9d2aD0F0E906f5cC1385283C6aaA800Ee1c97e
@@ -51,12 +66,16 @@ func main() {
 	}
 
 	config := &ethtestserver.ETHTestServerConfig{
-		AutoMining:     true,
+		AutoMining:     *autoMine, // Use the autoMine flag to enable or disable automatic mining
 		HTTPHost:       "localhost",
 		HTTPPort:       8545,
 		InitialSigners: knownWallets,
-		DBMode:         "disk", // memory", // Use in-memory database for testing
-		MaxBlockNum:    10_000,
+
+		ReorgProbability: 0.01, // 1% chance of reorgs
+		ReorgDepthMin:    3,    // minimum depth for reorgs
+		ReorgDepthMax:    6,    // maximum depth for reorgs
+
+		DBMode: "disk",
 		InitialBalances: map[common.Address]*big.Int{
 			wallet0.Address(): initialBalance,
 			wallet1.Address(): initialBalance,
@@ -76,15 +95,6 @@ func main() {
 		},
 	}
 
-	// generate a large number of additional monkey signers
-	monkeySigners := ethtestserver.GenSigners(500)
-
-	// add monkey signers to the config so they can be used in the test server
-	for _, signer := range monkeySigners {
-		config.InitialSigners = append(config.InitialSigners, signer)
-		config.InitialBalances[signer.Address()] = initialBalance
-	}
-
 	server, err := ethtestserver.NewETHTestServer(config)
 	if err != nil {
 		slog.Error("Failed to create test server", "error", err)
@@ -94,71 +104,85 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Trap SIGINT and SIGTERM and cancel the context when received.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		slog.Info("Received shutdown signal, initiating graceful shutdown...")
+		cancel()
+	}()
+
 	err = server.Run(ctx)
 	if err != nil {
 		log.Fatalf("Failed to run test server: %v", err)
 	}
-	defer server.Stop(ctx)
 
 	slog.Info("ETH Test server started successfully", "endpoint", server.HTTPEndpoint())
 	go printStatus(ctx, server)
 
-	// run monkey transferors for native ETH
-	go func() {
-		monkeyTransferor, err := runMonkeyTransferors(ctx, server, knownWallets, knownWallets)
-		if err != nil {
-			slog.Error("Failed to run monkey transferors", "error", err)
-			return
-		}
+	if *runNative || *runAll {
+		// Run monkey transferors for native ETH
+		go func() {
+			monkeyTransferor, err := runMonkeyTransferors(ctx, server, knownWallets, knownWallets)
+			if err != nil {
+				slog.Error("Failed to run monkey transferors", "error", err)
+				return
+			}
+			<-ctx.Done()
+			monkeyTransferor.Stop(ctx)
+		}()
+	}
 
-		<-ctx.Done()
-		monkeyTransferor.Stop(ctx)
-	}()
+	if *runERC1155 || *runAll {
+		// Run monkey transferors for ERC1155
+		go func() {
+			monkeyERC1155Transferor, err := runMonkeyERC1155Transferors(ctx, server, knownWallets, knownWallets, 1, 256, 1000)
+			if err != nil {
+				slog.Error("Failed to run monkey ERC1155 transferors", "error", err)
+				return
+			}
+			<-ctx.Done()
+			monkeyERC1155Transferor.Stop(ctx)
+		}()
+	}
 
-	// run monkey transferors for ERC1155
-	go func() {
-		monkeyERC1155Transferor, err := runMonkeyERC1155Transferors(ctx, server, knownWallets, knownWallets, 1, 256, 1000)
-		if err != nil {
-			slog.Error("Failed to run monkey ERC1155 transferors", "error", err)
-			return
-		}
+	if *runERC20 || *runAll {
+		// Run monkey transferors for ERC20
+		go func() {
+			monkeyERC20Transferor, err := runMonkeyERC20Transferors(ctx, server, knownWallets, knownWallets, 10_000)
+			if err != nil {
+				slog.Error("Failed to run monkey ERC20 transferors", "error", err)
+				return
+			}
+			<-ctx.Done()
+			monkeyERC20Transferor.Stop(ctx)
+		}()
+	}
 
-		<-ctx.Done()
-		monkeyERC1155Transferor.Stop(ctx)
-	}()
-
-	// run monkey transferors for ERC20
-	go func() {
-		monkeyERC20Transferor, err := runMonkeyERC20Transferors(ctx, server, knownWallets, knownWallets, 10_000)
-		if err != nil {
-			slog.Error("Failed to run monkey ERC20 transferors", "error", err)
-			return
-		}
-
-		<-ctx.Done()
-		monkeyERC20Transferor.Stop(ctx)
-	}()
-
-	// run monkey transferors for ERC721
-	go func() {
-		monkeyERC721Transferor, err := runMonkeyERC721Transferors(ctx, server, knownWallets, knownWallets, 256)
-		if err != nil {
-			slog.Error("Failed to run monkey ERC721 transferors", "error", err)
-			return
-		}
-
-		<-ctx.Done()
-		monkeyERC721Transferor.Stop(ctx)
-	}()
+	if *runERC721 || *runAll {
+		// Run monkey transferors for ERC721
+		go func() {
+			monkeyERC721Transferor, err := runMonkeyERC721Transferors(ctx, server, knownWallets, knownWallets, 256)
+			if err != nil {
+				slog.Error("Failed to run monkey ERC721 transferors", "error", err)
+				return
+			}
+			<-ctx.Done()
+			monkeyERC721Transferor.Stop(ctx)
+		}()
+	}
 
 	<-ctx.Done()
 	slog.Info("Test run completed, stopping server")
 
 	err = server.Stop(ctx)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		slog.Error("Failed to stop test server", "error", err)
 		os.Exit(1)
-		return
 	}
 }
 
