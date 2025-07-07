@@ -58,3 +58,7 @@ server.Stop(ctx)
 
 *ETHTestServer is designed for testing and development environments. It is not
 intended for production blockchain networks.*
+
+## License
+
+[Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
