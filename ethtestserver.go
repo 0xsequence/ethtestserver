@@ -26,7 +26,6 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/history"
-	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth"
@@ -35,15 +34,13 @@ import (
 	"github.com/ethereum/go-ethereum/eth/filters"
 	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/ethdb"
-	"github.com/ethereum/go-ethereum/ethdb/memorydb"
-	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/ethereum/go-ethereum/triedb"
 
-	cockroachdbpebble "github.com/cockroachdb/pebble"
+	"go.etcd.io/bbolt"
 )
 
 const (
@@ -59,7 +56,8 @@ const (
 )
 
 var (
-	defaultLogLevel = slog.LevelDebug
+	defaultLogLevel    = slog.LevelDebug
+	defaultStateBucket = []byte("default-state")
 )
 
 // ETHContractCaller represents a deployed contract.
@@ -115,8 +113,8 @@ type ETHTestServer struct {
 	running atomic.Bool // Indicates if the server is currently running
 
 	config    *ETHTestServerConfig
-	stateDB   *cockroachdbpebble.DB // State database for the test server
-	stateDBMu sync.Mutex            // Mutex to protect stateDB access
+	stateDB   *bbolt.DB  // State database for the test server
+	stateDBMu sync.Mutex // Mutex to protect stateDB access
 
 	initialized bool      // Whether the server has been initialized
 	startTime   time.Time // Time when mining started
@@ -156,19 +154,23 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	}
 
 	// Ensure the data directory exists.
-	if config.DBMode == dbModeDisk {
-		if err := os.MkdirAll(config.DataDir, 0755); err != nil {
-			return nil, fmt.Errorf("failed to create data directory %s: %w", config.DataDir, err)
-		}
+	if err := os.MkdirAll(s.resolvePath(storeDataDir), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create data directory %s: %w", config.DataDir, err)
 	}
 
 	var err error
-	s.stateDB, err = cockroachdbpebble.Open(
-		s.resolvePath(storeDataDir),
-		&cockroachdbpebble.Options{},
-	)
+	stateDBPath := s.resolvePath(storeDataDir, "state.db")
+	s.stateDB, err = bbolt.Open(stateDBPath, 0600, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create state store: %w", err)
+		return nil, fmt.Errorf("failed to open bbolt state store at %s: %w", stateDBPath, err)
+	}
+	err = s.stateDB.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(defaultStateBucket)
+		return err
+	})
+	if err != nil {
+		s.stateDB.Close()
+		return nil, fmt.Errorf("failed to create default state bucket: %w", err)
 	}
 
 	// Validate configuration (e.g. reorg parameters).
@@ -580,19 +582,22 @@ func (s *ETHTestServer) RetrieveValue(key string, value interface{}) (bool, erro
 		return false, fmt.Errorf("state database is not initialized")
 	}
 
-	data, closer, err := s.stateDB.Get([]byte(key))
-	if err != nil {
-		if errors.Is(err, cockroachdbpebble.ErrNotFound) {
-			return false, nil // Key not found
+	var data []byte
+	err := s.stateDB.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(defaultStateBucket)
+		val := b.Get([]byte(key))
+		if val != nil {
+			// Copy value, as it's only valid for the transaction lifetime.
+			data = make([]byte, len(val))
+			copy(data, val)
 		}
+		return nil
+	})
+	if err != nil {
 		return false, fmt.Errorf("failed to get state for key %s: %w", key, err)
 	}
 
-	if err := closer.Close(); err != nil {
-		return false, fmt.Errorf("failed to close state data for key %s: %w", key, err)
-	}
-
-	if len(data) == 0 {
+	if data == nil {
 		return false, nil // Key not found
 	}
 
@@ -629,7 +634,11 @@ func (s *ETHTestServer) StoreValue(key string, value interface{}) error {
 		return fmt.Errorf("state database is not initialized")
 	}
 
-	if err := s.stateDB.Set([]byte(key), buf.Bytes(), cockroachdbpebble.Sync); err != nil {
+	err := s.stateDB.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(defaultStateBucket)
+		return b.Put([]byte(key), buf.Bytes())
+	})
+	if err != nil {
 		return fmt.Errorf("failed to store state for key %s: %w", key, err)
 	}
 
@@ -648,7 +657,10 @@ func (s *ETHTestServer) DeleteValue(key string) error {
 		return fmt.Errorf("state database is not initialized")
 	}
 
-	err := s.stateDB.Delete([]byte(key), cockroachdbpebble.Sync)
+	err := s.stateDB.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(defaultStateBucket)
+		return b.Delete([]byte(key))
+	})
 	if err != nil {
 		return fmt.Errorf("failed to delete state for key %s: %w", key, err)
 	}
@@ -958,60 +970,6 @@ func (s *ETHTestServer) waitForTxIndexing(ctx context.Context) error {
 			}
 		}
 	}
-}
-
-func (s *ETHTestServer) makeKeyValueStore(stack *node.Node, options *node.DatabaseOptions) (ethdb.KeyValueStore, error) {
-	if stack == nil {
-		return nil, fmt.Errorf("stack cannot be nil")
-	}
-	if options == nil {
-		return nil, fmt.Errorf("options cannot be nil")
-	}
-
-	if s.config.DBMode == dbModeMemory {
-		return memorydb.New(), nil
-	}
-
-	kvdb, err := pebble.New(
-		stack.ResolvePath("chaindata"),
-		options.Cache,
-		options.Handles,
-		options.MetricsNamespace,
-		options.ReadOnly,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open pebble database: %w", err)
-	}
-
-	return kvdb, nil
-}
-
-func (s *ETHTestServer) openDatabase(stack *node.Node, readOnly bool) (ethdb.Database, error) {
-	options := node.DatabaseOptions{
-		ReadOnly:          readOnly,
-		Cache:             512,
-		Handles:           512,
-		AncientsDirectory: stack.ResolveAncient("chaindata", ""),
-	}
-
-	kvdb, err := s.makeKeyValueStore(stack, &options)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create key-value store: %w", err)
-	}
-
-	opts := rawdb.OpenOptions{
-		ReadOnly:         readOnly,
-		Ancient:          options.AncientsDirectory,
-		Era:              options.EraDirectory,
-		MetricsNamespace: options.MetricsNamespace,
-	}
-
-	db, err := rawdb.Open(kvdb, opts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open raw database: %w", err)
-	}
-
-	return db, nil
 }
 
 var _ runnable.Runnable = (*ETHTestServer)(nil)
