@@ -51,6 +51,8 @@ const (
 
 	chainDataDir = "chain" // Directory for chain data
 	storeDataDir = "state" // Directory for the test server state
+
+	maxMiningRetries = 5 // Maximum number of retries for mining a block
 )
 
 const (
@@ -60,6 +62,10 @@ const (
 
 var (
 	defaultLogLevel = slog.LevelDebug
+)
+
+var (
+	ErrLimitReached = fmt.Errorf("ETHTestServer: limit reached, cannot generate more blocks")
 )
 
 // ETHContractCaller represents a deployed contract.
@@ -80,8 +86,8 @@ type ETHTestServerStats struct {
 
 // ETHTestServerConfig represents the configuration for ETHTestServer.
 type ETHTestServerConfig struct {
-	AutoMining bool          // Whether to enable mining on the test server
-	MineRate   time.Duration // How often to mine a new block
+	AutoMining         bool          // Whether to enable mining on the test server
+	AutoMiningInterval time.Duration // How often to mine a new block
 
 	MaxBlockNum uint64        // Maximum block number for the test server (if nonzero)
 	MaxDuration time.Duration // Maximum mining duration (if nonzero)
@@ -105,6 +111,9 @@ type ETHTestServerConfig struct {
 
 	HTTPHost string // Host to bind the HTTP RPC server to
 	HTTPPort int    // Port to bind the HTTP RPC server to
+
+	WSHost string // Host to bind the WebSocket RPC server to
+	WSPort int    // Port to bind the WebSocket RPC server to
 
 	Artifacts []ethartifact.Artifact // JSON artifacts to load into the registry
 }
@@ -155,6 +164,20 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		config.DataDir = defaultDataDir
 	}
 
+	// Validate reorg configuration.
+	if config.ReorgProbability < 0 || config.ReorgProbability > 1 {
+		return nil, fmt.Errorf("ReorgProbability must be between 0 and 1, got %f", config.ReorgProbability)
+	}
+
+	if config.ReorgProbability > 0 {
+		if config.ReorgDepthMin <= 0 {
+			return nil, fmt.Errorf("ReorgDepthMin must be >0 when ReorgProbability > 0, got %d", config.ReorgDepthMin)
+		}
+		if config.ReorgDepthMax < config.ReorgDepthMin {
+			return nil, fmt.Errorf("ReorgDepthMax (got %d) must be >= ReorgDepthMin (%d)", config.ReorgDepthMax, config.ReorgDepthMin)
+		}
+	}
+
 	// Ensure the data directory exists.
 	if config.DBMode == dbModeDisk {
 		if err := os.MkdirAll(config.DataDir, 0755); err != nil {
@@ -171,23 +194,9 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 		return nil, fmt.Errorf("failed to create state store: %w", err)
 	}
 
-	// Validate configuration (e.g. reorg parameters).
-	if config.ReorgProbability < 0 || config.ReorgProbability > 1 {
-		return nil, fmt.Errorf("ReorgProbability must be between 0 and 1, got %f", config.ReorgProbability)
-	}
-
-	if config.ReorgProbability > 0 {
-		if config.ReorgDepthMin <= 0 {
-			return nil, fmt.Errorf("ReorgDepthMin must be >0 when ReorgProbability > 0, got %d", config.ReorgDepthMin)
-		}
-		if config.ReorgDepthMax < config.ReorgDepthMin {
-			return nil, fmt.Errorf("ReorgDepthMax (got %d) must be >= ReorgDepthMin (%d)", config.ReorgDepthMax, config.ReorgDepthMin)
-		}
-	}
-
 	// Set a default mine rate.
-	if config.MineRate == 0 {
-		config.MineRate = 1 * time.Second
+	if config.AutoMiningInterval == 0 {
+		config.AutoMiningInterval = 1 * time.Second
 	}
 
 	if config.HTTPHost == "" {
@@ -195,6 +204,12 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	}
 	if config.HTTPPort == 0 {
 		config.HTTPPort = 0
+	}
+	if config.WSHost == "" {
+		config.WSHost = "127.0.0.1"
+	}
+	if config.WSPort == 0 {
+		config.WSPort = 0
 	}
 	if config.NodeConfig == nil {
 		config.NodeConfig = &node.Config{}
@@ -205,7 +220,10 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	config.NodeConfig.DataDir = s.resolvePath(chainDataDir)
 	config.NodeConfig.HTTPHost = config.HTTPHost
 	config.NodeConfig.HTTPPort = config.HTTPPort
+	config.NodeConfig.WSHost = config.WSHost
+	config.NodeConfig.WSPort = config.WSPort
 	config.NodeConfig.HTTPModules = []string{"eth", "net", "web3", "txpool"}
+	config.NodeConfig.WSModules = []string{"eth", "net", "web3", "txpool"}
 	config.NodeConfig.Logger = log.NewLogger(
 		slog.NewJSONHandler(
 			os.Stdout,
@@ -249,7 +267,7 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 			config.Genesis.Config = params.AllDevChainProtocolChanges
 		}
 		if config.Genesis.GasLimit == 0 {
-			config.Genesis.GasLimit = 5_000_000
+			config.Genesis.GasLimit = 20_000_000
 		}
 		if config.Genesis.BaseFee == nil {
 			config.Genesis.BaseFee = big.NewInt(params.InitialBaseFee)
@@ -293,7 +311,7 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 	config.ServiceConfig.Genesis = config.Genesis
 	config.ServiceConfig.SyncMode = ethconfig.FullSync
 	config.ServiceConfig.HistoryMode = history.KeepAll
-	config.ServiceConfig.FilterLogCacheSize = 1000
+	config.ServiceConfig.FilterLogCacheSize = 5_000
 
 	if !initialized {
 		db, err := s.openDatabase(stack, false)
@@ -399,97 +417,112 @@ func (s *ETHTestServer) IsRunning() bool {
 	return s.running.Load()
 }
 
+// Run starts the ETHTestServer
 func (s *ETHTestServer) Run(ctx context.Context) error {
-	if s == nil {
-		return fmt.Errorf("ETHTestServer: nil server instance")
-	}
-
-	if s.running.Load() {
-		return fmt.Errorf("ETHTestServer: server is already running")
+	if err := s.validateRunPreconditions(); err != nil {
+		return err
 	}
 	s.running.Store(true)
 
-	if s.node == nil {
-		return fmt.Errorf("ETHTestServer: node not initialized")
+	if err := s.ensureChainInitialized(); err != nil {
+		return err
 	}
 
-	if s.ethereum == nil {
-		return fmt.Errorf("ETHTestServer: ethereum service not initialized")
-	}
-
-	if !s.initialized {
-		// Generate the first empty block to initialize the chain.
-		if _, _, err := s.GenerateBlocks(1, nil); err != nil {
-			return fmt.Errorf("ETHTestServer: failed to generate initial block: %w", err)
-		}
-	}
-
-	err := s.node.Start()
-	if err != nil {
+	if err := s.node.Start(); err != nil {
 		return fmt.Errorf("ETHTestServer: failed to start Geth node: %w", err)
 	}
 
 	// Wrap the incoming context with a cancellation function for internal use.
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancelFunc = cancel
-
-	// Record the mining start time.
 	s.startTime = time.Now()
 
-	// Launch the auto-mining goroutine.
 	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		if !s.config.AutoMining {
-			slog.Info("AutoMining is disabled; skipping block generation")
-			return
-		}
-
-		ticker := time.NewTicker(s.config.MineRate)
-		defer ticker.Stop()
-
-		var timeoutTimer *time.Timer
-		var timeoutChan <-chan time.Time
-		if s.config.MaxDuration > 0 {
-			timeoutTimer = time.NewTimer(s.config.MaxDuration)
-			timeoutChan = timeoutTimer.C
-			defer timeoutTimer.Stop()
-			slog.Info("Mining will stop after max duration", "maxDuration", s.config.MaxDuration,
-				"stopTime", s.startTime.Add(s.config.MaxDuration).Format(time.RFC3339))
-		}
-
-		for {
-			select {
-			case <-ctx.Done():
-				slog.Info("Stopping mining due to context cancellation")
-				return
-
-			case <-timeoutChan:
-				elapsed := time.Since(s.startTime)
-				slog.Info("Stopping mining: maximum duration reached", "maxDuration", s.config.MaxDuration, "elapsed", elapsed)
-				return
-
-			case <-ticker.C:
-				err := s.mineBlock()
-				if err != nil {
-					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-						slog.Info("Stopping mining due to context error", "error", err)
-						return
-					}
-					slog.Warn("Failed to mine a block; will retry", "error", err)
-				}
-			}
-		}
-	}()
+	go s.runMainLoop(ctx)
 
 	return nil
+}
+
+func (s *ETHTestServer) validateRunPreconditions() error {
+	if s == nil {
+		return fmt.Errorf("ETHTestServer: nil server instance")
+	}
+	if s.running.Load() {
+		return fmt.Errorf("ETHTestServer: server is already running")
+	}
+	if s.node == nil {
+		return fmt.Errorf("ETHTestServer: node not initialized")
+	}
+	if s.ethereum == nil {
+		return fmt.Errorf("ETHTestServer: ethereum service not initialized")
+	}
+	return nil
+}
+
+func (s *ETHTestServer) ensureChainInitialized() error {
+	if !s.initialized {
+		if _, _, err := s.GenerateBlocks(1, nil); err != nil {
+			return fmt.Errorf("ETHTestServer: failed to generate initial block: %w", err)
+		}
+	}
+	return nil
+}
+
+// runMainLoop runs the main block generation, and fork simulation loop.
+func (s *ETHTestServer) runMainLoop(ctx context.Context) {
+	defer s.wg.Done()
+
+	if !s.config.AutoMining {
+		slog.Info("Auto mining is disabled, skipping main loop")
+		return
+	}
+
+	ticker := time.NewTicker(s.config.AutoMiningInterval)
+	defer ticker.Stop()
+
+	var timeoutTimer *time.Timer
+	var timeoutChan <-chan time.Time
+	if s.config.MaxDuration > 0 {
+		timeoutTimer = time.NewTimer(s.config.MaxDuration)
+		timeoutChan = timeoutTimer.C
+		defer timeoutTimer.Stop()
+		slog.Info("Mining will stop after max duration", "maxDuration", s.config.MaxDuration,
+			"stopTime", s.startTime.Add(s.config.MaxDuration).Format(time.RFC3339))
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("Stopping mining due to context cancellation")
+			return
+
+		case <-timeoutChan:
+			elapsed := time.Since(s.startTime)
+			slog.Info("Stopping mining: maximum duration reached", "maxDuration", s.config.MaxDuration, "elapsed", elapsed)
+			return
+
+		case <-ticker.C:
+			err := s.nextTick()
+			if err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					slog.Info("Stopping mining due to context error", "error", err)
+					return
+				}
+
+				slog.Warn("Failed to execute mining tick", "error", err)
+			}
+		}
+	}
 }
 
 // simulateFork simulates a blockchain fork at the given block number.
 func (s *ETHTestServer) simulateFork(blockNumber int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.simulateForkUnlocked(blockNumber)
+}
 
+func (s *ETHTestServer) simulateForkUnlocked(blockNumber int) error {
 	if blockNumber < 0 {
 		return fmt.Errorf("blockNumber must be non-negative, got %d", blockNumber)
 	}
@@ -517,10 +550,9 @@ func (s *ETHTestServer) Stop(ctx context.Context) error {
 		return fmt.Errorf("ETHTestServer: nil server instance")
 	}
 
-	if !s.running.Load() {
+	if !s.running.CompareAndSwap(true, false) {
 		return fmt.Errorf("ETHTestServer: server is not running")
 	}
-	defer s.running.Store(false)
 
 	// Cancel any background operations and wait for them to finish.
 	if s.cancelFunc != nil {
@@ -573,6 +605,9 @@ func (s *ETHTestServer) Stop(ctx context.Context) error {
 }
 
 func (s *ETHTestServer) RetrieveValue(key string, value interface{}) (bool, error) {
+	if !s.IsRunning() {
+		return false, fmt.Errorf("ETHTestServer: server is not running")
+	}
 	s.stateDBMu.Lock()
 	defer s.stateDBMu.Unlock()
 
@@ -609,6 +644,9 @@ func (s *ETHTestServer) RetrieveValue(key string, value interface{}) (bool, erro
 }
 
 func (s *ETHTestServer) StoreValue(key string, value interface{}) error {
+	if !s.IsRunning() {
+		return fmt.Errorf("ETHTestServer: server is not running")
+	}
 	if len(key) == 0 {
 		return fmt.Errorf("key cannot be empty")
 	}
@@ -637,6 +675,9 @@ func (s *ETHTestServer) StoreValue(key string, value interface{}) error {
 }
 
 func (s *ETHTestServer) DeleteValue(key string) error {
+	if !s.IsRunning() {
+		return fmt.Errorf("ETHTestServer: server is not running")
+	}
 	if len(key) == 0 {
 		return fmt.Errorf("key cannot be empty")
 	}
@@ -650,7 +691,7 @@ func (s *ETHTestServer) DeleteValue(key string) error {
 
 	err := s.stateDB.Delete([]byte(key), cockroachdbpebble.Sync)
 	if err != nil {
-		return fmt.Errorf("failed to delete state for key %s: %w", key, err)
+		return fmt.Errorf("failed to delete state for key %s: %w", string(key), err)
 	}
 
 	return nil
@@ -658,8 +699,25 @@ func (s *ETHTestServer) DeleteValue(key string) error {
 
 // GenerateBlocks generates n blocks using the provided block generation function.
 func (s *ETHTestServer) GenerateBlocks(n int, blockGenFn func(int, *core.BlockGen) error) ([]*types.Block, []types.Receipts, error) {
+	if !s.IsRunning() {
+		return nil, nil, fmt.Errorf("ETHTestServer: server is not running")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	currentBlock := s.ethereum.BlockChain().CurrentBlock()
+	currentBlockNumber := currentBlock.Number.Uint64()
+
+	if s.config.MaxBlockNum > 0 && currentBlockNumber >= s.config.MaxBlockNum {
+		slog.Debug("ETHTestServer: maximum block number reached, cannot generate more blocks",
+			"maxBlockNum", s.config.MaxBlockNum, "currentBlock", currentBlockNumber)
+		return nil, nil, ErrLimitReached
+	}
+
+	return s.generateBlocksUnlocked(n, blockGenFn)
+}
+
+func (s *ETHTestServer) generateBlocksUnlocked(n int, blockGenFn func(int, *core.BlockGen) error) ([]*types.Block, []types.Receipts, error) {
 
 	if n <= 0 {
 		return nil, nil, fmt.Errorf("ETHTestServer: number of blocks to generate must be > 0")
@@ -668,18 +726,6 @@ func (s *ETHTestServer) GenerateBlocks(n int, blockGenFn func(int, *core.BlockGe
 	bc := s.ethereum.BlockChain()
 	latestBlockHeader := bc.CurrentBlock()
 	latestBlock := bc.GetBlock(latestBlockHeader.Hash(), latestBlockHeader.Number.Uint64())
-
-	// Check limits.
-	if latestBlock.Number().Uint64() >= s.config.MaxBlockNum && s.config.MaxBlockNum > 0 {
-		return nil, nil, fmt.Errorf("ETHTestServer: reached maximum block number %d", s.config.MaxBlockNum)
-	}
-
-	if s.config.MaxDuration > 0 && !s.startTime.IsZero() {
-		elapsed := time.Since(s.startTime)
-		if elapsed >= s.config.MaxDuration {
-			return nil, nil, fmt.Errorf("ETHTestServer: reached maximum duration %v (elapsed: %v)", s.config.MaxDuration, elapsed)
-		}
-	}
 
 	var genErr error
 	blocks, receipts := core.GenerateChain(
@@ -717,14 +763,24 @@ func (s *ETHTestServer) GenerateBlocks(n int, blockGenFn func(int, *core.BlockGe
 }
 
 func (s *ETHTestServer) HTTPEndpoint() string {
-	if s.node == nil {
+	if !s.IsRunning() || s.node == nil {
 		return ""
 	}
 	return s.node.HTTPEndpoint()
 }
 
+func (s *ETHTestServer) WSEndpoint() string {
+	if !s.IsRunning() || s.node == nil {
+		return ""
+	}
+	return s.node.WSEndpoint()
+}
+
 // DeployContract deploys a contract using the given signer and returns a caller.
 func (s *ETHTestServer) DeployContract(signer *Signer, contractName string, constructorArgs ...interface{}) (*ETHContractCaller, error) {
+	if !s.IsRunning() {
+		return nil, fmt.Errorf("ETHTestServer: server is not running")
+	}
 	artifact, ok := s.artifacts.Get(contractName)
 	if !ok {
 		return nil, fmt.Errorf("contract %s not found in registry", contractName)
@@ -751,7 +807,7 @@ func (s *ETHTestServer) DeployContract(signer *Signer, contractName string, cons
 		tx := types.NewContractCreation(
 			nonce,
 			new(big.Int),
-			3_000_000, // Gas limit
+			5_000_000, // Gas limit
 			gen.BaseFee(),
 			calldata,
 		)
@@ -788,6 +844,9 @@ func (s *ETHTestServer) DeployContract(signer *Signer, contractName string, cons
 
 // ContractTransact calls a contract method using the given signer.
 func (s *ETHTestServer) ContractTransact(signer *Signer, contract *ETHContractCaller, methodName string, methodArgs ...interface{}) error {
+	if !s.IsRunning() {
+		return fmt.Errorf("ETHTestServer: server is not running")
+	}
 	if signer == nil {
 		return fmt.Errorf("signer cannot be nil")
 	}
@@ -832,12 +891,21 @@ func (s *ETHTestServer) ContractTransact(signer *Signer, contract *ETHContractCa
 
 // PrintStatus logs the current status using our stats.
 func (s *ETHTestServer) PrintStatus() {
+	if !s.IsRunning() {
+		slog.Warn("Cannot print status, server is not running")
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	bc := s.ethereum.BlockChain()
+	currentBlock := bc.CurrentBlock()
+	currentBlockNumber := currentBlock.Number.Uint64()
 
 	stats := s.stats
 
 	logFields := []interface{}{
+		"headBlock", currentBlockNumber,
 		"currentBlock", stats.CurrentBlock,
 		"blocksMined", stats.BlocksMined,
 		"txCount", stats.TxCount,
@@ -866,14 +934,61 @@ func (s *ETHTestServer) PrintStatus() {
 
 // Mine triggers a block mining operation.
 func (s *ETHTestServer) Mine() error {
-	return s.mineBlock()
+	if !s.IsRunning() {
+		return fmt.Errorf("ETHTestServer: server is not running")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.maybeGenerateBlock()
 }
 
-// mineBlock generates one block (using GenerateBlocks), optionally simulates a fork,
-// and then updates the stats.
-func (s *ETHTestServer) mineBlock() error {
-	_, _, err := s.GenerateBlocks(1, func(i int, gen *core.BlockGen) error {
+// nextTick performs the next mining operation, generating a block and possibly
+// simulating a fork.
+func (s *ETHTestServer) nextTick() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	errs := []error{}
+
+	// If conditions are met, generate a block.
+	if err := s.maybeGenerateBlock(); err != nil {
+		errs = append(errs, fmt.Errorf("failed to generate block: %w", err))
+	}
+
+	// If reorg is enabled, try to simulate a fork.
+	if err := s.maybeSimulateFork(); err != nil {
+		errs = append(errs, fmt.Errorf("failed to simulate fork: %w", err))
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("ETHTestServer: errors during mining tick: %v", errors.Join(errs...))
+	}
+
+	return nil
+}
+
+func (s *ETHTestServer) maybeGenerateBlock() error {
+	bc := s.ethereum.BlockChain()
+	currentBlock := bc.CurrentBlock()
+	currentBlockNumber := currentBlock.Number.Uint64()
+
+	if s.config.MaxBlockNum > 0 && currentBlockNumber >= s.config.MaxBlockNum {
+		slog.Debug("ETHTestServer: reached maximum block number", "maxBlockNum", s.config.MaxBlockNum, "currentBlock", currentBlockNumber)
+		return nil // No more blocks to generate
+	}
+
+	if s.config.MaxDuration > 0 && !s.startTime.IsZero() {
+		elapsed := time.Since(s.startTime)
+		if elapsed >= s.config.MaxDuration {
+			slog.Debug("ETHTestServer: reached maximum duration", "maxDuration", s.config.MaxDuration, "elapsed", elapsed)
+			return nil // No more blocks to generate
+		}
+	}
+
+	blocks, _, err := s.generateBlocksUnlocked(1, func(i int, gen *core.BlockGen) error {
 		latestBlockHeader := s.ethereum.BlockChain().CurrentBlock()
+
 		txPool := s.ethereum.TxPool()
 		pending := txPool.Pending(txpool.PendingFilter{})
 		var gasUsed uint64
@@ -901,30 +1016,47 @@ func (s *ETHTestServer) mineBlock() error {
 		return fmt.Errorf("failed to generate block: %w", err)
 	}
 
-	// If reorg is enabled, try to simulate a fork.
-	if s.config.ReorgProbability > 0 && rand.Float64() < s.config.ReorgProbability {
-		bc := s.ethereum.BlockChain()
-		currentHeight := int(bc.CurrentBlock().Number.Uint64())
-		depthRange := s.config.ReorgDepthMax - s.config.ReorgDepthMin + 1
+	if len(blocks) > 0 {
+		slog.Debug("ETHTestServer: latest block generated", "blockNumber", blocks[0].Number().Uint64(), "blockHash", blocks[0].Hash().Hex())
+	}
 
-		var depth int
-		if depthRange > 1 {
-			depth = rand.Intn(depthRange) + s.config.ReorgDepthMin
-		} else {
-			depth = s.config.ReorgDepthMin
-		}
+	return nil
+}
 
-		if depth >= currentHeight {
-			depth = currentHeight - 1
-		}
+func (s *ETHTestServer) maybeSimulateFork() error {
+	if s.config.ReorgProbability <= 0 {
+		return nil // No reorg simulation needed
+	}
 
-		if depth > 0 {
-			if err := s.simulateFork(currentHeight - depth); err != nil {
-				return fmt.Errorf("failed to simulate fork: %w", err)
-			}
-		} else {
-			slog.Info("Not enough blocks to simulate a fork", "chainHeight", currentHeight)
+	triggered := rand.Float64() < s.config.ReorgProbability
+	if !triggered {
+		return nil // No reorg simulation this time
+	}
+
+	bc := s.ethereum.BlockChain()
+	currentHeight := int(bc.CurrentBlock().Number.Uint64())
+	depthRange := s.config.ReorgDepthMax - s.config.ReorgDepthMin + 1
+
+	var depth int
+	if depthRange > 1 {
+		depth = rand.Intn(depthRange) + s.config.ReorgDepthMin
+	} else {
+		depth = s.config.ReorgDepthMin
+	}
+
+	if depth >= currentHeight {
+		depth = currentHeight - 1
+	}
+
+	if depth > 0 {
+		slog.Info("Simulating fork", "chainHeight", currentHeight, "forkDepth", depth)
+		if err := s.simulateForkUnlocked(currentHeight - depth); err != nil {
+			return fmt.Errorf("failed to simulate fork: %w", err)
 		}
+		currentHeight = int(bc.CurrentBlock().Number.Uint64())
+		slog.Info("Fork simulated successfully", "chainHeight", currentHeight, "forkDepth", depth)
+	} else {
+		slog.Info("Not enough blocks to simulate a fork", "chainHeight", currentHeight)
 	}
 
 	return nil
