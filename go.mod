@@ -9,6 +9,7 @@ toolchain go1.24.0
 require (
 	github.com/0xsequence/ethkit v1.35.2
 	github.com/0xsequence/runnable v0.0.2
+	github.com/cockroachdb/pebble v1.1.5
 	github.com/ethereum/go-ethereum v1.16.1
 )
 
@@ -35,7 +36,6 @@ require (
 	github.com/cockroachdb/errors v1.11.3 // indirect
 	github.com/cockroachdb/fifo v0.0.0-20240606204812-0bbfbd93a7ce // indirect
 	github.com/cockroachdb/logtags v0.0.0-20241215232642-bb51bb14a506 // indirect
-	github.com/cockroachdb/pebble v1.1.5 // indirect
 	github.com/cockroachdb/redact v1.1.6 // indirect
 	github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06 // indirect
 	github.com/consensys/gnark-crypto v0.18.0 // indirect

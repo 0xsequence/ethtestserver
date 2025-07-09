@@ -51,6 +51,8 @@ const (
 
 	chainDataDir = "chain" // Directory for chain data
 	storeDataDir = "state" // Directory for the test server state
+
+	maxMiningRetries = 5 // Maximum number of retries for mining a block
 )
 
 const (
@@ -399,97 +401,123 @@ func (s *ETHTestServer) IsRunning() bool {
 	return s.running.Load()
 }
 
+// Run starts the ETHTestServer
 func (s *ETHTestServer) Run(ctx context.Context) error {
-	if s == nil {
-		return fmt.Errorf("ETHTestServer: nil server instance")
-	}
-
-	if s.running.Load() {
-		return fmt.Errorf("ETHTestServer: server is already running")
+	if err := s.validateRunPreconditions(); err != nil {
+		return err
 	}
 	s.running.Store(true)
 
-	if s.node == nil {
-		return fmt.Errorf("ETHTestServer: node not initialized")
+	if err := s.ensureChainInitialized(); err != nil {
+		return err
 	}
 
-	if s.ethereum == nil {
-		return fmt.Errorf("ETHTestServer: ethereum service not initialized")
-	}
-
-	if !s.initialized {
-		// Generate the first empty block to initialize the chain.
-		if _, _, err := s.GenerateBlocks(1, nil); err != nil {
-			return fmt.Errorf("ETHTestServer: failed to generate initial block: %w", err)
-		}
-	}
-
-	err := s.node.Start()
-	if err != nil {
+	if err := s.node.Start(); err != nil {
 		return fmt.Errorf("ETHTestServer: failed to start Geth node: %w", err)
 	}
 
 	// Wrap the incoming context with a cancellation function for internal use.
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancelFunc = cancel
-
-	// Record the mining start time.
 	s.startTime = time.Now()
 
-	// Launch the auto-mining goroutine.
 	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		if !s.config.AutoMining {
-			slog.Info("AutoMining is disabled; skipping block generation")
-			return
-		}
-
-		ticker := time.NewTicker(s.config.MineRate)
-		defer ticker.Stop()
-
-		var timeoutTimer *time.Timer
-		var timeoutChan <-chan time.Time
-		if s.config.MaxDuration > 0 {
-			timeoutTimer = time.NewTimer(s.config.MaxDuration)
-			timeoutChan = timeoutTimer.C
-			defer timeoutTimer.Stop()
-			slog.Info("Mining will stop after max duration", "maxDuration", s.config.MaxDuration,
-				"stopTime", s.startTime.Add(s.config.MaxDuration).Format(time.RFC3339))
-		}
-
-		for {
-			select {
-			case <-ctx.Done():
-				slog.Info("Stopping mining due to context cancellation")
-				return
-
-			case <-timeoutChan:
-				elapsed := time.Since(s.startTime)
-				slog.Info("Stopping mining: maximum duration reached", "maxDuration", s.config.MaxDuration, "elapsed", elapsed)
-				return
-
-			case <-ticker.C:
-				err := s.mineBlock()
-				if err != nil {
-					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-						slog.Info("Stopping mining due to context error", "error", err)
-						return
-					}
-					slog.Warn("Failed to mine a block; will retry", "error", err)
-				}
-			}
-		}
-	}()
+	go s.runAutoMiningLoop(ctx)
 
 	return nil
+}
+
+func (s *ETHTestServer) validateRunPreconditions() error {
+	if s == nil {
+		return fmt.Errorf("ETHTestServer: nil server instance")
+	}
+	if s.running.Load() {
+		return fmt.Errorf("ETHTestServer: server is already running")
+	}
+	if s.node == nil {
+		return fmt.Errorf("ETHTestServer: node not initialized")
+	}
+	if s.ethereum == nil {
+		return fmt.Errorf("ETHTestServer: ethereum service not initialized")
+	}
+	return nil
+}
+
+func (s *ETHTestServer) ensureChainInitialized() error {
+	if !s.initialized {
+		if _, _, err := s.GenerateBlocks(1, nil); err != nil {
+			return fmt.Errorf("ETHTestServer: failed to generate initial block: %w", err)
+		}
+	}
+	return nil
+}
+
+// runAutoMiningLoop runs the main block generation loop in a separate goroutine.
+func (s *ETHTestServer) runAutoMiningLoop(ctx context.Context) {
+	defer s.wg.Done()
+
+	if !s.config.AutoMining {
+		slog.Info("AutoMining is disabled; skipping block generation")
+		return
+	}
+
+	ticker := time.NewTicker(s.config.MineRate)
+	defer ticker.Stop()
+
+	var timeoutTimer *time.Timer
+	var timeoutChan <-chan time.Time
+	if s.config.MaxDuration > 0 {
+		timeoutTimer = time.NewTimer(s.config.MaxDuration)
+		timeoutChan = timeoutTimer.C
+		defer timeoutTimer.Stop()
+		slog.Info("Mining will stop after max duration", "maxDuration", s.config.MaxDuration,
+			"stopTime", s.startTime.Add(s.config.MaxDuration).Format(time.RFC3339))
+	}
+
+	var miningFailures int
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("Stopping mining due to context cancellation")
+			return
+
+		case <-timeoutChan:
+			elapsed := time.Since(s.startTime)
+			slog.Info("Stopping mining: maximum duration reached", "maxDuration", s.config.MaxDuration, "elapsed", elapsed)
+			return
+
+		case <-ticker.C:
+			err := s.mineBlock()
+			if err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					slog.Info("Stopping mining due to context error", "error", err)
+					return
+				}
+
+				// Increment failure count and check against the limit.
+				miningFailures++
+				slog.Warn("Failed to mine a block; will retry", "error", err, "attempt", miningFailures, "maxRetries", maxMiningRetries)
+
+				if miningFailures >= maxMiningRetries {
+					slog.Error("Exceeded maximum mining retries, stopping auto-mining.", "lastError", err)
+					return
+				}
+			} else {
+				// Reset the failure count on a successful mine.
+				miningFailures = 0
+			}
+		}
+	}
 }
 
 // simulateFork simulates a blockchain fork at the given block number.
 func (s *ETHTestServer) simulateFork(blockNumber int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.simulateForkUnlocked(blockNumber)
+}
 
+func (s *ETHTestServer) simulateForkUnlocked(blockNumber int) error {
 	if blockNumber < 0 {
 		return fmt.Errorf("blockNumber must be non-negative, got %d", blockNumber)
 	}
@@ -660,7 +688,10 @@ func (s *ETHTestServer) DeleteValue(key string) error {
 func (s *ETHTestServer) GenerateBlocks(n int, blockGenFn func(int, *core.BlockGen) error) ([]*types.Block, []types.Receipts, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.generateBlocksUnlocked(n, blockGenFn)
+}
 
+func (s *ETHTestServer) generateBlocksUnlocked(n int, blockGenFn func(int, *core.BlockGen) error) ([]*types.Block, []types.Receipts, error) {
 	if n <= 0 {
 		return nil, nil, fmt.Errorf("ETHTestServer: number of blocks to generate must be > 0")
 	}
@@ -872,7 +903,10 @@ func (s *ETHTestServer) Mine() error {
 // mineBlock generates one block (using GenerateBlocks), optionally simulates a fork,
 // and then updates the stats.
 func (s *ETHTestServer) mineBlock() error {
-	_, _, err := s.GenerateBlocks(1, func(i int, gen *core.BlockGen) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, _, err := s.generateBlocksUnlocked(1, func(i int, gen *core.BlockGen) error {
 		latestBlockHeader := s.ethereum.BlockChain().CurrentBlock()
 		txPool := s.ethereum.TxPool()
 		pending := txPool.Pending(txpool.PendingFilter{})
@@ -919,7 +953,7 @@ func (s *ETHTestServer) mineBlock() error {
 		}
 
 		if depth > 0 {
-			if err := s.simulateFork(currentHeight - depth); err != nil {
+			if err := s.simulateForkUnlocked(currentHeight - depth); err != nil {
 				return fmt.Errorf("failed to simulate fork: %w", err)
 			}
 		} else {
