@@ -251,7 +251,7 @@ func NewETHTestServer(config *ETHTestServerConfig) (*ETHTestServer, error) {
 			config.Genesis.Config = params.AllDevChainProtocolChanges
 		}
 		if config.Genesis.GasLimit == 0 {
-			config.Genesis.GasLimit = 5_000_000
+			config.Genesis.GasLimit = 20_000_000
 		}
 		if config.Genesis.BaseFee == nil {
 			config.Genesis.BaseFee = big.NewInt(params.InitialBaseFee)
@@ -782,7 +782,7 @@ func (s *ETHTestServer) DeployContract(signer *Signer, contractName string, cons
 		tx := types.NewContractCreation(
 			nonce,
 			new(big.Int),
-			3_000_000, // Gas limit
+			5_000_000, // Gas limit
 			gen.BaseFee(),
 			calldata,
 		)

@@ -15,7 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-const gasLimit = 300_000
+const gasLimit = 3_000_000
 
 var monkeyOperatorConfig monkey.MonkeyOperatorConfig
 
