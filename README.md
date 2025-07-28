@@ -11,8 +11,10 @@ scenarios easy to implement.
 
 ## Features
 
-- **Reorg Testing**: Simulate chain reorganizations to test application resilience
-- **Custom Genesis**: Define initial blockchain state with custom accounts and contracts
+- **Reorg Testing**: Simulate chain reorganizations to test application
+  resilience
+- **Custom Genesis**: Define initial blockchain state with custom accounts and
+  contracts
 - **Artifact Management**: Load and deploy contracts from JSON artifacts
 - **State Persistence**: Maintain test state across server restarts
 - **Runtime Controls**: Set mining limits by block count or duration
@@ -54,6 +56,88 @@ go server.Run(ctx)
 
 // Cleanup
 server.Stop(ctx)
+```
+
+## CLI Usage
+
+`ETHTestServer` also includes a powerful command-line interface (CLI) that runs
+the test server as a standalone process. This is ideal for when you don't want
+to integrate the server directly into your Go test suite.
+
+The CLI also includes "monkey" operators to automatically generate a variety of
+transaction types for simulating blockchain noise.
+
+### Installation
+
+```
+go install github.com/0xsequence/ethtestserver/cmd/ethtestserver@latest
+```
+
+### Basic Usage
+
+To start a default server with auto-mining enabled every second:
+
+```sh
+ethtestserver --auto-mine
+```
+
+The server will start and print its RPC endpoint (default:
+`http://localhost:8545`).
+
+#### 1. High-Load Stress Test
+
+This command simulates a busy network with a high volume of diverse
+transactions, running for 10,000 blocks.
+
+```sh
+ethtestserver \
+  --auto-mine \
+  --run-all \
+  --min-transactions-per-block=50 \
+  --max-transactions-per-block=100 \
+  --max-blocks=10000 \
+  --data-dir=./data-stress-test
+```
+
+#### 2. Deep Chain Reorganization Test
+
+This command runs a simulation with a 10% chance of a very deep reorg (50-90
+blocks) occurring after each block is mined.
+
+```sh
+ethtestserver \
+  --auto-mine \
+  --run-all \
+  --max-blocks=10000 \
+  --reorg-probability=0.1 \
+  --reorg-depth-min=50 \
+  --reorg-depth-max=90 \
+  --data-dir=./data-reorg-test
+```
+
+#### 3. Maximum Throughput Benchmark
+
+This command configures the server for maximum transaction throughput by
+reducing mining and transaction generation intervals.
+
+```sh
+ethtestserver \
+  --auto-mine \
+  --run-all \
+  --min-transactions-per-block=120 \
+  --max-transactions-per-block=180 \
+  --auto-mine-interval=1 \
+  --monkey-mine-interval=1 \
+  --max-blocks=50000 \
+  --data-dir=./data-throughput-test
+```
+
+### All Options
+
+For a full list of available flags and their descriptions, run:
+
+```sh
+ethtestserver --help
 ```
 
 *ETHTestServer is designed for testing and development environments. It is not

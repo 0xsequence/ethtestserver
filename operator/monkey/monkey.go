@@ -2,6 +2,7 @@ package monkey
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -9,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/0xsequence/ethtestserver"
 	"github.com/0xsequence/ethtestserver/operator"
 	"github.com/0xsequence/runnable"
 	"github.com/ethereum/go-ethereum/core"
@@ -137,6 +139,12 @@ func (m *MonkeyOperator) Run(ctx context.Context) error {
 				ticks++
 
 				if err != nil {
+					if errors.Is(err, ethtestserver.ErrLimitReached) {
+						// sometimes limits are not permanent, for instance, if there is a reorg then
+						// there might be more blocks to generate, so we just log the error and continue
+						//slog.Debug("MonkeyOperator: limit reached, continuing...", "error", err)
+						continue
+					}
 					slog.Error("MonkeyOperator: failed to generate blocks, stopping...", "error", err)
 					return
 				}
@@ -163,6 +171,10 @@ func (m *MonkeyOperator) IsRunning() bool {
 
 // Stop signals the operator to stop and waits for it to finish gracefully.
 func (m *MonkeyOperator) Stop(ctx context.Context) error {
+	if m == nil {
+		return fmt.Errorf("MonkeyOperator: operator is nil")
+	}
+
 	// Ensure that we only signal stop once.
 	m.stopOnce.Do(func() {
 		close(m.stopCh)
