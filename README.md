@@ -70,7 +70,7 @@ transaction types for simulating blockchain noise.
 ### Installation
 
 ```
-go install github.com/0xsequence/ethtestserver/cmd/ethtestserver@latest
+go install github.com/0xsequence/ethtestserver/cmd/ethtestserver
 ```
 
 ### Basic Usage
