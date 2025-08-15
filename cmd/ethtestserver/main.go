@@ -151,7 +151,6 @@ func main() {
 			slog.Error("Failed to run ethtestserver", "error", runErr)
 			return fmt.Errorf("failed to run ethtestserver: %w", runErr)
 		}
-		defer slog.Info("ethtestserver stopped")
 
 		slog.Info("ethtestserver is running", "endpoint", server.HTTPEndpoint())
 		return nil

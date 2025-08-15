@@ -439,6 +439,8 @@ func (s *ETHTestServer) Run(ctx context.Context) error {
 	s.wg.Add(1)
 	go s.runMainLoop(ctx)
 
+	s.running.Store(true)
+
 	return nil
 }
 
@@ -459,19 +461,20 @@ func (s *ETHTestServer) validateRunPreconditions() error {
 }
 
 func (s *ETHTestServer) ensureChainInitialized() error {
-	if !s.initialized {
-		if _, _, err := s.GenerateBlocks(1, nil); err != nil {
-			return fmt.Errorf("ETHTestServer: failed to generate initial block: %w", err)
-		}
+	if s.initialized {
+		return nil
 	}
+
+	if _, _, err := s.GenerateBlocks(1, nil); err != nil {
+		return fmt.Errorf("ETHTestServer: failed to generate initial block: %w", err)
+	}
+
 	return nil
 }
 
 // runMainLoop runs the main block generation, and fork simulation loop.
 func (s *ETHTestServer) runMainLoop(ctx context.Context) {
 	defer s.wg.Done()
-
-	s.running.Store(true)
 
 	if !s.config.AutoMining {
 		slog.Info("Auto mining is disabled, skipping main loop")
@@ -700,9 +703,6 @@ func (s *ETHTestServer) DeleteValue(key string) error {
 
 // GenerateBlocks generates n blocks using the provided block generation function.
 func (s *ETHTestServer) GenerateBlocks(n int, blockGenFn func(int, *core.BlockGen) error) ([]*types.Block, []types.Receipts, error) {
-	if !s.IsRunning() {
-		return nil, nil, fmt.Errorf("ETHTestServer: server is not running")
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
