@@ -422,14 +422,13 @@ func (s *ETHTestServer) Run(ctx context.Context) error {
 	if err := s.validateRunPreconditions(); err != nil {
 		return err
 	}
-	s.running.Store(true)
-
-	if err := s.ensureChainInitialized(); err != nil {
-		return err
-	}
 
 	if err := s.node.Start(); err != nil {
 		return fmt.Errorf("ETHTestServer: failed to start Geth node: %w", err)
+	}
+
+	if err := s.ensureChainInitialized(); err != nil {
+		return err
 	}
 
 	// Wrap the incoming context with a cancellation function for internal use.
@@ -471,6 +470,8 @@ func (s *ETHTestServer) ensureChainInitialized() error {
 // runMainLoop runs the main block generation, and fork simulation loop.
 func (s *ETHTestServer) runMainLoop(ctx context.Context) {
 	defer s.wg.Done()
+
+	s.running.Store(true)
 
 	if !s.config.AutoMining {
 		slog.Info("Auto mining is disabled, skipping main loop")
