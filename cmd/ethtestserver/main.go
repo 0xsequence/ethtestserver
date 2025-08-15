@@ -148,28 +148,39 @@ func main() {
 
 	g.Go(func() error {
 		if runErr := server.Run(ctx); runErr != nil {
+			slog.Error("Failed to run ethtestserver", "error", runErr)
 			return fmt.Errorf("failed to run ethtestserver: %w", runErr)
 		}
-		defer slog.Info("ethtestserver stopped")
 
 		slog.Info("ethtestserver is running", "endpoint", server.HTTPEndpoint())
 		return nil
 	})
 
 	// Wait for the server to start before proceeding with monkey transferors
+	maxWaitingTime := time.NewTimer(30 * time.Second)
+	defer maxWaitingTime.Stop()
+
 	for !server.IsRunning() {
 		select {
 		case <-ctx.Done():
-			slog.Info("Context done before server started, exiting...")
+			slog.Error("Failed to start ethtestserver, exiting", "error", ctx.Err())
+			os.Exit(1)
+		case <-maxWaitingTime.C:
+			slog.Error("Timeout waiting for ethtestserver to start")
+			os.Exit(1)
 		case <-time.After(100 * time.Millisecond):
-			slog.Info("Waiting for ethtestserver to start...")
+			slog.Debug("Waiting for ethtestserver to start...")
 		}
 	}
 
 	g.Go(func() error {
 		<-ctx.Done()
 		slog.Info("Stopping server...")
-		if stopErr := server.Stop(context.Background()); stopErr != nil && !errors.Is(stopErr, context.Canceled) {
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if stopErr := server.Stop(shutdownCtx); stopErr != nil && !errors.Is(stopErr, context.Canceled) {
 			return fmt.Errorf("failed to stop server cleanly: %w", stopErr)
 		}
 		return nil
