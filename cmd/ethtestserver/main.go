@@ -19,18 +19,13 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-var (
-	ERC20TestTokenArtifact   = ethtestserver.ERC20TestTokenArtifact
-	ERC721TestTokenArtifact  = ethtestserver.ERC721TestTokenArtifact
-	ERC1155TestTokenArtifact = ethtestserver.ERC1155TestTokenArtifact
-)
-
 func main() {
 	var (
-		runNative  = flag.Bool("run-native", false, "Run monkey transferors for native ETH transactions")
-		runERC1155 = flag.Bool("run-erc1155", false, "Run monkey transferors for ERC1155 transactions")
-		runERC20   = flag.Bool("run-erc20", false, "Run monkey transferors for ERC20 transactions")
-		runERC721  = flag.Bool("run-erc721", false, "Run monkey transferors for ERC721 transactions")
+		runNative    = flag.Bool("run-native", false, "Run monkey transferors for native ETH transactions")
+		runERC1155   = flag.Bool("run-erc1155", false, "Run monkey transferors for ERC1155 transactions")
+		runERC20     = flag.Bool("run-erc20", false, "Run monkey transferors for ERC20 transactions")
+		runERC721    = flag.Bool("run-erc721", false, "Run monkey transferors for ERC721 transactions")
+		runUniswapV2 = flag.Bool("run-uniswap-v2", false, "Run monkey transferors for Uniswap V2 transactions")
 
 		runAll           = flag.Bool("run-all", false, "Run all monkey transferors (native, ERC20, ERC721, ERC1155)")
 		autoMine         = flag.Bool("auto-mine", false, "Enable automatic mining of new blocks")
@@ -112,9 +107,12 @@ func main() {
 		DBMode:             "disk",
 		InitialBalances:    initialBalances,
 		Artifacts: []ethartifact.Artifact{
-			ERC20TestTokenArtifact,
-			ERC721TestTokenArtifact,
-			ERC1155TestTokenArtifact,
+			ethtestserver.ERC20TestTokenArtifact,
+			ethtestserver.ERC721TestTokenArtifact,
+			ethtestserver.ERC1155TestTokenArtifact,
+			ethtestserver.WETH9Artifact,
+			ethtestserver.UniswapV2FactoryArtifact,
+			ethtestserver.UniswapV2Router02Artifact,
 		},
 	}
 
@@ -244,6 +242,21 @@ func main() {
 			}
 			<-ctx.Done()
 			monkeyTransferor.Stop(context.Background())
+			return nil
+		})
+	}
+
+	if *runUniswapV2 || *runAll {
+		g.Go(func() error {
+			monkeyTrader, err := runMonkeyUniswapV2TradeGenerator(ctx, server, knownWallets)
+			if err != nil {
+				if errors.Is(err, ethtestserver.ErrLimitReached) {
+					return nil
+				}
+				return fmt.Errorf("failed to run native monkey: %w", err)
+			}
+			<-ctx.Done()
+			monkeyTrader.Stop(context.Background())
 			return nil
 		})
 	}

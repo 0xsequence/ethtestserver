@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"math/rand"
 	"sync"
+	"time"
 
 	"github.com/0xsequence/ethtestserver"
 	"github.com/0xsequence/ethtestserver/operator/monkey"
@@ -105,7 +106,7 @@ func (g *ERC1155TransactionGenerator) Initialize(ctx context.Context) error {
 		deployer := g.senders[0]
 		contract, err = g.server.DeployContract(
 			deployer,
-			ERC1155TestTokenArtifact.ContractName,
+			ethtestserver.ERC1155TestTokenArtifact.ContractName,
 			deployer.Address(),
 		)
 		if err != nil {
@@ -230,7 +231,7 @@ func (g *ERC20TransactionGenerator) Initialize(ctx context.Context) error {
 		contractInitialOwner := g.senders[0]
 		contract, err = g.server.DeployContract(
 			deployer,
-			ERC20TestTokenArtifact.ContractName,
+			ethtestserver.ERC20TestTokenArtifact.ContractName,
 			contractRecipient.Address(),
 			contractInitialOwner.Address(),
 		)
@@ -343,7 +344,7 @@ func (g *ERC721TransactionGenerator) Initialize(ctx context.Context) error {
 		deployer := ethtestserver.PickRandomSigner(g.senders)
 		contract, err = g.server.DeployContract(
 			deployer,
-			ERC721TestTokenArtifact.ContractName,
+			ethtestserver.ERC721TestTokenArtifact.ContractName,
 			deployer.Address(),
 		)
 		if err != nil {
@@ -454,6 +455,275 @@ func (g *ERC721TransactionGenerator) GenerateTransaction(ctx context.Context, ge
 	return signedTx, nil
 }
 
+// UniswapV2TradeGenerator simulates a Uniswap V2 trade between two ERC20 tokens.
+type UniswapV2TradeGenerator struct {
+	server      *ethtestserver.ETHTestServer
+	signers     []*ethtestserver.Signer
+	router      *ethtestserver.ETHContractCaller
+	factory     *ethtestserver.ETHContractCaller
+	tokenA      *ethtestserver.ETHContractCaller
+	tokenB      *ethtestserver.ETHContractCaller
+	initialized bool
+}
+
+// Keys in the state database are used to avoid re-deployments.
+const (
+	stateFactoryKey   = "uniswapV2:factory"
+	stateRouterKey    = "uniswapV2:router"
+	stateTokenAKey    = "uniswapV2:tokenA"
+	stateTokenBKey    = "uniswapV2:tokenB"
+	stateLiquidityKey = "uniswapV2:liquidityAdded"
+)
+
+// NewUniswapV2TradeGenerator returns an instance that simulates trades.
+func NewUniswapV2TradeGenerator(server *ethtestserver.ETHTestServer, signers []*ethtestserver.Signer) *UniswapV2TradeGenerator {
+	return &UniswapV2TradeGenerator{
+		server:  server,
+		signers: signers,
+	}
+}
+
+// Initialize deploys or retrieves the Uniswap V2 Factory, Router, and two ERC20 tokens.
+// It also performs an initial liquidity addition.
+func (g *UniswapV2TradeGenerator) Initialize(ctx context.Context) error {
+	// Retrieve or deploy the Factory.
+	var factory *ethtestserver.ETHContractCaller
+	ok, err := g.server.RetrieveValue(stateFactoryKey, &factory)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve factory: %w", err)
+	}
+
+	if ok {
+		g.factory = factory
+	} else {
+		signer := g.signers[0]
+		factory, err = g.server.DeployContract(signer, ethtestserver.UniswapV2FactoryArtifact.ContractName,
+			// The constructor typically takes the feeToSetter address.
+			signer.Address(),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to deploy UniswapV2Factory: %w", err)
+		}
+		if err := g.server.StoreValue(stateFactoryKey, factory); err != nil {
+			return fmt.Errorf("failed to store factory state: %w", err)
+		}
+		g.factory = factory
+	}
+
+	// Retrieve or deploy the WETH9 contract.
+	var wethCaller *ethtestserver.ETHContractCaller
+	ok, err = g.server.RetrieveValue("uniswapV2:weth", &wethCaller)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve WETH9: %w", err)
+	}
+	if !ok {
+		// Deploy WETH9 contract if not present.
+		signer := g.signers[0]
+		wethCaller, err = g.server.DeployContract(signer, ethtestserver.WETH9Artifact.ContractName)
+		if err != nil {
+			return fmt.Errorf("failed to deploy WETH9: %w", err)
+		}
+		if err := g.server.StoreValue("uniswapV2:weth", wethCaller); err != nil {
+			return fmt.Errorf("failed to store WETH9 state: %w", err)
+		}
+	}
+
+	// Retrieve or deploy the Router.
+	var router *ethtestserver.ETHContractCaller
+	ok, err = g.server.RetrieveValue(stateRouterKey, &router)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve router: %w", err)
+	}
+	if ok {
+		g.router = router
+	} else {
+		signer := g.signers[0]
+		// The Router constructor usually takes (factory, WETH) addresses.
+		router, err = g.server.DeployContract(
+			signer,
+			ethtestserver.UniswapV2Router02Artifact.ContractName,
+			g.factory.Address,
+			wethCaller.Address,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to deploy UniswapV2Router02: %w", err)
+		}
+		if err := g.server.StoreValue(stateRouterKey, router); err != nil {
+			return fmt.Errorf("failed to store router state: %w", err)
+		}
+		g.router = router
+	}
+
+	// Retrieve or deploy tokenA.
+	var tokenA *ethtestserver.ETHContractCaller
+	ok, err = g.server.RetrieveValue(stateTokenAKey, &tokenA)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve tokenA: %w", err)
+	}
+	if ok {
+		g.tokenA = tokenA
+	} else {
+		signer := g.signers[0]
+		tokenA, err = g.server.DeployContract(
+			signer,
+			ethtestserver.ERC20TestTokenArtifact.ContractName,
+			signer.Address(),
+			signer.Address(), // Initial owner
+		)
+		if err != nil {
+			return fmt.Errorf("failed to deploy tokenA: %w", err)
+		}
+		if err := g.server.StoreValue(stateTokenAKey, tokenA); err != nil {
+			return fmt.Errorf("failed to store tokenA state: %w", err)
+		}
+		g.tokenA = tokenA
+	}
+
+	// Retrieve or deploy tokenB.
+	var tokenB *ethtestserver.ETHContractCaller
+	ok, err = g.server.RetrieveValue(stateTokenBKey, &tokenB)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve tokenB: %w", err)
+	}
+	if ok {
+		g.tokenB = tokenB
+	} else {
+		signer := g.signers[0]
+		tokenB, err = g.server.DeployContract(
+			signer,
+			ethtestserver.ERC20TestTokenArtifact.ContractName,
+			signer.Address(),
+			signer.Address(), // Initial owner
+		)
+		if err != nil {
+			return fmt.Errorf("failed to deploy tokenB: %w", err)
+		}
+		if err := g.server.StoreValue(stateTokenBKey, tokenB); err != nil {
+			return fmt.Errorf("failed to store tokenB state: %w", err)
+		}
+		g.tokenB = tokenB
+	}
+
+	// Add liquidity between tokenA and tokenB
+	var liquidityAdded bool
+	ok, err = g.server.RetrieveValue(stateLiquidityKey, &liquidityAdded)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve liquidity state: %w", err)
+	}
+	if !ok || !liquidityAdded {
+		// For liquidity, use the router's addLiquidity function. For testing, set a fixed amount for each token.
+		liquidityAmountA := big.NewInt(1e18) // for example, 1 token (in wei units)
+		liquidityAmountB := big.NewInt(1e18)
+		deadline := big.NewInt(time.Now().Add(5 * time.Minute).Unix())
+		// For simplicity, use the deployer as liquidity provider.
+		signer := g.signers[0]
+		calldata, err := g.router.ABI.Pack(
+			"addLiquidity",
+			g.tokenA.Address, // token A address
+			g.tokenB.Address, // token B address
+			liquidityAmountA, // amountADesired
+			liquidityAmountB, // amountBDesired
+			big.NewInt(0),    // amountAMin (for testing)
+			big.NewInt(0),    // amountBMin (for testing)
+			signer.Address(), // to
+			deadline,         // deadline
+		)
+		if err != nil {
+			return fmt.Errorf("failed to pack addLiquidity call: %w", err)
+		}
+
+		// Use the test server to generate a block containing the liquidity tx.
+		_, _, err = g.server.GenerateBlocks(1, func(i int, gen *core.BlockGen) error {
+			nonce := gen.TxNonce(signer.Address())
+
+			tx := types.NewTransaction(
+				nonce,
+				g.router.Address, // calling router contract
+				nil,
+				gasLimit,
+				gen.BaseFee(),
+				calldata,
+			)
+
+			signedTx, err := types.SignTx(tx, gen.Signer(), signer.RawPrivateKey())
+			if err != nil {
+				return fmt.Errorf("failed to sign liquidity tx: %w", err)
+			}
+
+			gen.AddTx(signedTx)
+
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("failed to add liquidity: %w", err)
+		}
+
+		if err := g.server.StoreValue(stateLiquidityKey, true); err != nil {
+			return fmt.Errorf("failed to store liquidity state: %w", err)
+		}
+	}
+
+	g.initialized = true
+	return nil
+}
+
+// GenerateTransaction creates a swap transaction using swapExactTokensForTokens.
+// It picks a random signer from the list and a random trade amount.
+func (g *UniswapV2TradeGenerator) GenerateTransaction(ctx context.Context, gen *core.BlockGen) (*types.Transaction, error) {
+	if !g.initialized {
+		return nil, fmt.Errorf("UniswapV2TradeGenerator not initialized")
+	}
+
+	slog.Info("Generating Uniswap V2 trade transaction",
+		"tokenA", g.tokenA.Address.Hex(),
+		"tokenB", g.tokenB.Address.Hex(),
+		"router", g.router.Address.Hex(),
+		"factory", g.factory.Address.Hex(),
+	)
+
+	// Pick a random signer to act as the trade initiator.
+	sender := ethtestserver.PickRandomSigner(g.signers)
+	// Random trade amount between 1 and 100 units.
+	amountIn := ethtestserver.PickRandomAmount(1, 100)
+	amountOutMin := big.NewInt(0) // For testing, we set 0 minimum output.
+
+	// Define the swap path [tokenA, tokenB].
+	path := []common.Address{
+		g.tokenA.Address,
+		g.tokenB.Address,
+	}
+	// Set a deadline a few minutes in the future.
+	deadline := big.NewInt(time.Now().Add(5 * time.Minute).Unix())
+
+	calldata, err := g.router.ABI.Pack("swapExactTokensForTokens",
+		amountIn,
+		amountOutMin,
+		path,
+		sender.Address(), // recipient is the sender in this simulation
+		deadline,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to pack swapExactTokensForTokens: %w", err)
+	}
+
+	nonce := gen.TxNonce(sender.Address())
+	tx := types.NewTransaction(
+		nonce,
+		g.router.Address,
+		nil,
+		gasLimit,
+		gen.BaseFee(), // use the current base fee
+		calldata,
+	)
+
+	signedTx, err := types.SignTx(tx, gen.Signer(), sender.RawPrivateKey())
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign swap transaction: %w", err)
+	}
+
+	return signedTx, nil
+}
+
 func runMonkeyTransferors(ctx context.Context, server *ethtestserver.ETHTestServer, senders, recipients []*ethtestserver.Signer) (*monkey.MonkeyOperator, error) {
 	txGen := NewNativeTransactionGenerator(senders, recipients)
 	if err := txGen.Initialize(ctx); err != nil {
@@ -537,6 +807,28 @@ func runMonkeyERC721Transferors(ctx context.Context, server *ethtestserver.ETHTe
 
 	if err = monkeyOperator.Run(ctx); err != nil {
 		return nil, fmt.Errorf("failed to run monkey ERC721 transfer operator: %w", err)
+	}
+
+	return monkeyOperator, nil
+}
+
+func runMonkeyUniswapV2TradeGenerator(ctx context.Context, server *ethtestserver.ETHTestServer, signers []*ethtestserver.Signer) (*monkey.MonkeyOperator, error) {
+	tradeGen := NewUniswapV2TradeGenerator(server, signers)
+	if err := tradeGen.Initialize(ctx); err != nil {
+		return nil, fmt.Errorf("failed to initialize UniswapV2TradeGenerator: %w", err)
+	}
+
+	monkeyOperator, err := monkey.NewMonkeyOperatorWithConfig(
+		&monkeyOperatorConfig,
+		server,
+		tradeGen,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create monkey Uniswap V2 trade operator: %w", err)
+	}
+
+	if err = monkeyOperator.Run(ctx); err != nil {
+		return nil, fmt.Errorf("failed to run monkey Uniswap V2 trade operator: %w", err)
 	}
 
 	return monkeyOperator, nil

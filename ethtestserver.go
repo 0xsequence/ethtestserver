@@ -476,8 +476,6 @@ func (s *ETHTestServer) ensureChainInitialized() error {
 func (s *ETHTestServer) runMainLoop(ctx context.Context) {
 	defer s.wg.Done()
 
-	s.running.Store(true)
-
 	if !s.config.AutoMining {
 		slog.Info("Auto mining is disabled, skipping main loop")
 		return
